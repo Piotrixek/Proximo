@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proxy DLL Generator (Proximo)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #121212;
+            color: #E0E0E0;
+        }
+        /* Custom scrollbar for a more integrated look */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #1E1E1E;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #4A4A4A;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #5A5A5A;
+        }
+        /* Custom styles for specific elements */
+        .bg-primary { background-color: #121212; }
+        .bg-secondary { background-color: #1E1E1E; }
+        .text-primary { color: #E0E0E0; }
+        .text-accent { color: #00BFFF; }
+        .border-accent { border-color: #00BFFF; }
+        .bg-accent { background-color: #00BFFF; }
+        .bg-success { background-color: #50FA7B; }
+        .text-success { color: #50FA7B; }
+        .bg-warning { background-color: #FF6347; }
+        .text-warning { color: #FF6347; }
+
+        .custom-select, .custom-input {
+            background-color: #2a2a2a;
+            border: 1px solid #4a4a4a;
+            color: #E0E0E0;
+        }
+        .custom-select:focus, .custom-input:focus {
+            outline: none;
+            border-color: #00BFFF;
+            box-shadow: 0 0 0 2px rgba(0, 191, 255, 0.5);
+        }
+        .data-grid-header {
+            background-color: #2a2a2a;
+        }
+        .data-grid-row:hover {
+            background-color: #282828;
+        }
+        .data-grid-row-selected {
+            background-color: rgba(0, 191, 255, 0.1);
+            border-left: 3px solid #00BFFF;
+        }
+    </style>
+</head>
+<body class="bg-primary text-primary antialiased">
+
+    <div class="flex h-screen max-h-screen">
+        <!-- Left Panel: Controls -->
+        <div class="w-1/3 max-w-sm flex flex-col bg-secondary p-6 space-y-6 overflow-y-auto">
+            <!-- Header -->
+            <div class="flex-shrink-0">
+                <h1 class="text-2xl font-bold text-primary">Proximo</h1>
+                <div class="h-0.5 w-16 bg-accent mt-2"></div>
+            </div>
+
+            <!-- 1. Process Selection -->
+            <div class="space-y-2">
+                <label for="process-select" class="text-sm font-semibold text-primary/80">1. Select Process</label>
+                <div class="relative">
+                    <select id="process-select" class="custom-select w-full p-2 rounded-md appearance-none">
+                        <option>Select a running process...</option>
+                        <option value="game.exe">game.exe (PID: 1234)</option>
+                        <option value="editor.exe">editor.exe (PID: 5678)</option>
+                        <option value="browser.exe">browser.exe (PID: 9101)</option>
+                    </select>
+                    <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-primary/50">
+                        <i data-lucide="chevron-down" class="w-4 h-4"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 2. DLL Filtering -->
+            <div class="space-y-2 flex-grow flex flex-col min-h-0">
+                <label class="text-sm font-semibold text-primary/80">2. Filter DLLs</label>
+                <div id="dll-list-container" class="bg-[#2a2a2a] border border-[#4a4a4a] rounded-md p-3 flex-grow overflow-y-auto">
+                    <!-- DLLs will be populated here by JS -->
+                    <p class="text-primary/50 text-center py-4">Select a process to see its DLLs.</p>
+                </div>
+            </div>
+
+            <!-- 3. Generation Options -->
+            <div class="space-y-4 flex-shrink-0">
+                <h3 class="text-sm font-semibold text-primary/80">3. Generation</h3>
+                <div class="space-y-2">
+                    <label for="project-name" class="text-xs font-medium">Project Name:</label>
+                    <input type="text" id="project-name" class="custom-input w-full p-2 rounded-md text-sm" placeholder="e.g., MyProxyProject">
+                </div>
+                <div class="space-y-2">
+                    <label for="output-dir" class="text-xs font-medium">Output Directory:</label>
+                    <div class="flex">
+                        <input type="text" id="output-dir" class="custom-input w-full p-2 rounded-l-md text-sm" placeholder="C:\Projects\">
+                        <button class="bg-[#3a3a3a] hover:bg-[#4a4a4a] p-2 rounded-r-md border-y border-r border-[#4a4a4a]">
+                            <i data-lucide="folder-open" class="w-4 h-4"></i>
+                        </button>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-2">
+                    <input type="checkbox" id="generate-vs" class="h-4 w-4 rounded bg-[#2a2a2a] border-[#4a4a4a] text-accent focus:ring-accent">
+                    <label for="generate-vs" class="text-sm">Generate VS Project files</label>
+                </div>
+                <button id="generate-btn" class="w-full bg-success/80 hover:bg-success text-black font-bold py-3 rounded-md transition-colors duration-200 flex items-center justify-center space-x-2">
+                    <i data-lucide="play" class="w-5 h-5"></i>
+                    <span>Generate Project</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Right Panel: Data View -->
+        <div class="w-2/3 flex-grow flex flex-col p-6">
+            <div class="flex-shrink-0">
+                <h2 class="text-xl font-semibold">Functions Overview</h2>
+                <!-- Search Bar -->
+                <div class="relative mt-4">
+                    <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-primary/40"></i>
+                    <input type="text" id="function-search" placeholder="Filter by function or DLL name..." class="custom-input w-full p-3 pl-10 rounded-md">
+                </div>
+            </div>
+
+            <!-- Main Data View -->
+            <div class="mt-4 flex-grow overflow-y-auto">
+                <table class="w-full text-left text-sm">
+                    <thead class="sticky top-0">
+                        <tr class="data-grid-header text-primary/80">
+                            <th class="p-3 w-12"><input type="checkbox" id="select-all-funcs" class="h-4 w-4 rounded bg-[#2a2a2a] border-[#4a4a4a] text-accent focus:ring-accent"></th>
+                            <th class="p-3">Function Name</th>
+                            <th class="p-3">DLL Name</th>
+                            <th class="p-3">Type</th>
+                            <th class="p-3">Parameters</th>
+                        </tr>
+                    </thead>
+                    <tbody id="function-table-body">
+                        <!-- Functions will be populated here by JS -->
+                        <tr class="data-grid-row">
+                            <td colspan="5" class="text-center p-16 text-primary/50">
+                                <i data-lucide="list-x" class="w-12 h-12 mx-auto mb-2"></i>
+                                <p>No process selected</p>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Status Bar -->
+            <div class="flex-shrink-0 mt-4 h-10 flex items-center justify-between bg-secondary p-3 rounded-md">
+                <div class="flex items-center space-x-2">
+                    <span id="status-icon"></span>
+                    <span id="status-text" class="text-xs font-medium">Ready</span>
+                </div>
+                <div class="w-1/3 bg-[#2a2a2a] rounded-full h-1.5">
+                    <div id="progress-bar" class="bg-accent h-1.5 rounded-full" style="width: 0%"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- Mock Data ---
+        const mockData = {
+            "game.exe": {
+                dlls: ["d3d11.dll", "user32.dll", "kernel32.dll"],
+                functions: [
+                    { name: "D3D11CreateDevice", dll: "d3d11.dll", type: "Export", params: "(...)" },
+                    { name: "CreateDXGIFactory", dll: "d3d11.dll", type: "Export", params: "(...)" },
+                    { name: "MessageBoxA", dll: "user32.dll", type: "Import", params: "(HWND, LPCSTR, LPCSTR, UINT)" },
+                    { name: "GetClientRect", dll: "user32.dll", type: "Export", params: "(HWND, LPRECT)" },
+                    { name: "FindWindowA", dll: "user32.dll", type: "Import", params: "(LPCSTR, LPCSTR)" },
+                    { name: "CreateThread", dll: "kernel32.dll", type: "Export", params: "(...)" },
+                    { name: "VirtualAlloc", dll: "kernel32.dll", type: "Export", params: "(...)" },
+                ]
+            },
+            "editor.exe": {
+                dlls: ["core.dll", "ui.dll", "filesystem.dll"],
+                functions: [
+                    { name: "Core_Initialize", dll: "core.dll", type: "Export", params: "()" },
+                    { name: "UI_CreateWindow", dll: "ui.dll", type: "Export", params: "(int, int)" },
+                    { name: "FS_ReadFile", dll: "filesystem.dll", type: "Import", params: "(const char*)" },
+                ]
+            },
+            "browser.exe": {
+                dlls: ["net.dll", "crypto.dll", "renderer.dll"],
+                 functions: [
+                    { name: "NetOpenConnection", dll: "net.dll", type: "Export", params: "(URL)" },
+                    { name: "CryptoEncrypt", dll: "crypto.dll", type: "Export", params: "(data, key)" },
+                    { name: "RenderPage", dll: "renderer.dll", type: "Export", params: "(html)" },
+                ]
+            }
+        };
+
+        // --- DOM Elements ---
+        const processSelect = document.getElementById('process-select');
+        const dllListContainer = document.getElementById('dll-list-container');
+        const functionTableBody = document.getElementById('function-table-body');
+        const functionSearch = document.getElementById('function-search');
+        const selectAllFuncs = document.getElementById('select-all-funcs');
+        const statusText = document.getElementById('status-text');
+        const statusBarIcon = document.getElementById('status-icon');
+        const progressBar = document.getElementById('progress-bar');
+        const generateBtn = document.getElementById('generate-btn');
+
+        // --- Functions ---
+        function setStatus(text, icon = '', colorClass = 'text-primary/80', progress = 0) {
+            statusText.textContent = text;
+            statusText.className = `text-xs font-medium ${colorClass}`;
+            statusBarIcon.innerHTML = icon ? `<i data-lucide="${icon}" class="w-4 h-4"></i>` : '';
+            if (icon) lucide.createIcons();
+            progressBar.style.width = `${progress}%`;
+        }
+        
+        function renderDlls(dlls) {
+            if (!dlls || dlls.length === 0) {
+                dllListContainer.innerHTML = `<p class="text-primary/50 text-center py-4">No DLLs found for this process.</p>`;
+                return;
+            }
+            dllListContainer.innerHTML = dlls.map(dll => `
+                <div class="flex items-center space-x-2 p-1.5 rounded hover:bg-[#3a3a3a]">
+                    <input type="checkbox" data-dll="${dll}" class="dll-checkbox h-4 w-4 rounded bg-[#2a2a2a] border-[#4a4a4a] text-accent focus:ring-accent" checked>
+                    <label class="text-sm">${dll}</label>
+                </div>
+            `).join('');
+        }
+
+        function renderFunctions(functions, filteredDlls) {
+            const filteredFunctions = functions.filter(f => filteredDlls.includes(f.dll));
+            const searchTerm = functionSearch.value.toLowerCase();
+            
+            const functionsToRender = filteredFunctions.filter(f => 
+                f.name.toLowerCase().includes(searchTerm) || 
+                f.dll.toLowerCase().includes(searchTerm)
+            );
+
+            if (functionsToRender.length === 0) {
+                functionTableBody.innerHTML = `<tr class="data-grid-row"><td colspan="5" class="text-center p-16 text-primary/50"><i data-lucide="search-x" class="w-12 h-12 mx-auto mb-2"></i><p>No matching functions found.</p></td></tr>`;
+                lucide.createIcons();
+                return;
+            }
+
+            functionTableBody.innerHTML = functionsToRender.map(func => `
+                <tr class="data-grid-row border-b border-transparent">
+                    <td class="p-3"><input type="checkbox" class="func-checkbox h-4 w-4 rounded bg-[#2a2a2a] border-[#4a4a4a] text-accent focus:ring-accent"></td>
+                    <td class="p-3 font-medium">${func.name}</td>
+                    <td class="p-3 text-primary/70">${func.dll}</td>
+                    <td class="p-3">
+                        <span class="px-2 py-1 text-xs rounded-full ${func.type === 'Export' ? 'bg-blue-900/50 text-blue-300' : 'bg-purple-900/50 text-purple-300'}">
+                            ${func.type}
+                        </span>
+                    </td>
+                    <td class="p-3 text-primary/50 font-mono text-xs">${func.params}</td>
+                </tr>
+            `).join('');
+            
+            // Add click-to-select functionality
+            functionTableBody.querySelectorAll('tr').forEach(row => {
+               row.addEventListener('click', (e) => {
+                   if(e.target.type !== 'checkbox') {
+                       const checkbox = row.querySelector('.func-checkbox');
+                       if(checkbox) {
+                           checkbox.checked = !checkbox.checked;
+                           row.classList.toggle('data-grid-row-selected', checkbox.checked);
+                       }
+                   } else {
+                        row.classList.toggle('data-grid-row-selected', e.target.checked);
+                   }
+               }) 
+            });
+        }
+
+        function handleProcessChange() {
+            const selectedProcess = processSelect.value;
+            const data = mockData[selectedProcess];
+
+            if (!data) {
+                dllListContainer.innerHTML = `<p class="text-primary/50 text-center py-4">Select a process to see its DLLs.</p>`;
+                functionTableBody.innerHTML = `<tr class="data-grid-row"><td colspan="5" class="text-center p-16 text-primary/50"><i data-lucide="list-x" class="w-12 h-12 mx-auto mb-2"></i><p>No process selected</p></td></tr>`;
+                lucide.createIcons();
+                setStatus('Ready');
+                return;
+            }
+
+            setStatus('Analyzing...', 'loader-2 animate-spin', 'text-accent', 25);
+            
+            // Simulate analysis delay
+            setTimeout(() => {
+                renderDlls(data.dlls);
+                const checkedDlls = Array.from(document.querySelectorAll('.dll-checkbox:checked')).map(cb => cb.dataset.dll);
+                renderFunctions(data.functions, checkedDlls);
+                setStatus(`Analyzed ${selectedProcess}. Found ${data.functions.length} functions.`, 'check-circle', 'text-success', 100);
+                setTimeout(() => setStatus('Ready', '', 'text-primary/80', 0), 2000);
+            }, 500);
+        }
+
+        function handleFilterChange() {
+            const selectedProcess = processSelect.value;
+            const data = mockData[selectedProcess];
+            if (!data) return;
+
+            const checkedDlls = Array.from(document.querySelectorAll('.dll-checkbox:checked')).map(cb => cb.dataset.dll);
+            renderFunctions(data.functions, checkedDlls);
+        }
+
+        // --- Event Listeners ---
+        processSelect.addEventListener('change', handleProcessChange);
+        dllListContainer.addEventListener('change', (e) => {
+            if (e.target.classList.contains('dll-checkbox')) {
+                handleFilterChange();
+            }
+        });
+        functionSearch.addEventListener('input', handleFilterChange);
+        
+        selectAllFuncs.addEventListener('change', (e) => {
+            const checkboxes = document.querySelectorAll('.func-checkbox');
+            checkboxes.forEach(cb => {
+                cb.checked = e.target.checked;
+                cb.closest('tr').classList.toggle('data-grid-row-selected', cb.checked);
+            });
+        });
+
+        generateBtn.addEventListener('click', () => {
+            setStatus('Generating project...', 'cog animate-spin', 'text-accent', 0);
+            let progress = 0;
+            const interval = setInterval(() => {
+                progress += 10;
+                progressBar.style.width = `${progress}%`;
+                if (progress >= 100) {
+                    clearInterval(interval);
+                    setStatus('Project generated successfully!', 'party-popper', 'text-success', 100);
+                     setTimeout(() => setStatus('Ready', '', 'text-primary/80', 0), 3000);
+                }
+            }, 150);
+        });
+
+        // --- Initial Load ---
+        lucide.createIcons();
+    </script>
+</body>
+</html>

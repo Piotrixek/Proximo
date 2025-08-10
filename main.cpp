@@ -1,12 +1,11 @@
-﻿// #define NOMINMAX is removed to fix the redefinition warning
-#include <Windows.h>
+﻿#include <Windows.h>
 #include <tchar.h>
 #include <shellapi.h>
 #include <gdiplus.h>
 #include <objidl.h>
-#include <psapi.h> // For process enumeration
-#include <ShlObj.h> // For folder picker dialog
-#include <atlbase.h> // For CComPtr
+#include <psapi.h>
+#include <ShlObj.h>
+#include <atlbase.h>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -25,29 +24,27 @@
 #include <filesystem>
 #include <sstream>
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 #include <map>
-#include <algorithm> // for std::sort
+#include <algorithm>
+#include <set>
+#include <io.h>
+#include <fcntl.h>
 
-// Include the LIEF PE header
 #include <LIEF/PE.hpp>
 #include <LIEF/logging.hpp>
-#include <menu.h>
+#include "menu.h"
 
-// Global controller for our web UI
 std::unique_ptr<UltralightController> g_ultralight_controller;
 
 
-// --- C++ Backend Functions Exposed to JavaScript ---
-
-// Helper to execute JS in the UI thread safely
 void SafeEvalScript(std::string script) {
     if (g_ultralight_controller) {
         g_ultralight_controller->evalScript(script);
     }
 }
 
-// Helper to convert wstring to utf8 string
 std::string to_utf8(const std::wstring& wstr) {
     if (wstr.empty()) return std::string();
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
@@ -56,7 +53,6 @@ std::string to_utf8(const std::wstring& wstr) {
     return strTo;
 }
 
-// Called from JS to request the list of running processes
 void RequestProcessList(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
     std::vector<std::pair<DWORD, std::string>> processes;
     DWORD aProcesses[1024], cbNeeded, cProcesses;
@@ -69,12 +65,11 @@ void RequestProcessList(const ultralight::JSObject& thisObject, const ultralight
 
     for (unsigned int i = 0; i < cProcesses; i++) {
         if (aProcesses[i] != 0) {
-            WCHAR szProcessName[MAX_PATH] = L"<unknown>"; // Use WCHAR for Unicode
+            WCHAR szProcessName[MAX_PATH] = L"<unknown>";
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, aProcesses[i]);
             if (NULL != hProcess) {
                 HMODULE hMod;
                 DWORD cbNeeded2;
-                // Explicitly call the Wide version of the function
                 if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded2)) {
                     GetModuleBaseNameW(hProcess, hMod, szProcessName, sizeof(szProcessName) / sizeof(WCHAR));
                 }
@@ -84,12 +79,10 @@ void RequestProcessList(const ultralight::JSObject& thisObject, const ultralight
         }
     }
 
-    // Sort alphabetically by process name
     std::sort(processes.begin(), processes.end(), [](const auto& a, const auto& b) {
         return a.second < b.second;
         });
 
-    // Build JSON string to pass to the UI
     std::stringstream ss;
     ss << "[";
     for (size_t i = 0; i < processes.size(); ++i) {
@@ -98,11 +91,9 @@ void RequestProcessList(const ultralight::JSObject& thisObject, const ultralight
     }
     ss << "]";
 
-    // Call a JS function to populate the dropdown
     SafeEvalScript("populateProcessList(" + ss.str() + ");");
 }
 
-// Called from JS to get DLLs for a specific process
 void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
     if (args.size() < 1 || !args[0].IsNumber()) {
         SafeEvalScript("populateDlls([]);");
@@ -110,7 +101,15 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
     }
 
     DWORD processID = static_cast<DWORD>(args[0].ToNumber());
-    std::vector<std::pair<std::string, std::string>> dlls; // Pair of {name, full_path}
+
+    const std::set<std::string> system_dlls = {
+        "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll", "gdi32.dll",
+        "advapi32.dll", "comctl32.dll", "comdlg32.dll", "shell32.dll", "ole32.dll",
+        "oleaut32.dll", "rpcrt4.dll", "ws2_32.dll", "msvcrt.dll", "ucrtbase.dll",
+        "sechost.dll", "shlwapi.dll", "crypt32.dll", "bcrypt.dll", "win32u.dll"
+    };
+
+    std::vector<std::string> dlls_json;
     HMODULE hMods[1024];
     HANDLE hProcess;
     DWORD cbNeeded;
@@ -122,98 +121,167 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
     }
 
     if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+        bool first_selectable_found = false;
         for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
             WCHAR szModName[MAX_PATH];
             WCHAR szModPath[MAX_PATH];
-            // Explicitly call the Wide versions of the functions
             if (GetModuleBaseNameW(hProcess, hMods[i], szModName, sizeof(szModName) / sizeof(WCHAR)) &&
                 GetModuleFileNameExW(hProcess, hMods[i], szModPath, sizeof(szModPath) / sizeof(WCHAR)))
             {
                 std::string dllName = to_utf8(szModName);
                 std::string dllPath = to_utf8(szModPath);
 
-                // escape backslashes for json
+                std::string lowerDllName = dllName;
+                std::transform(lowerDllName.begin(), lowerDllName.end(), lowerDllName.begin(), ::tolower);
+
+                bool is_potential_selection = system_dlls.find(lowerDllName) == system_dlls.end();
+                bool is_selected = false;
+                if (is_potential_selection && !first_selectable_found) {
+                    is_selected = true;
+                    first_selectable_found = true;
+                }
+
                 size_t start_pos = 0;
                 while ((start_pos = dllPath.find("\\", start_pos)) != std::string::npos) {
                     dllPath.replace(start_pos, 1, "\\\\");
                     start_pos += 2;
                 }
 
-                dlls.push_back({ dllName, dllPath });
+                std::stringstream ss;
+                ss << "{ \"name\": \"" << dllName << "\", \"path\": \"" << dllPath << "\", \"selected\": " << (is_selected ? "true" : "false") << " }";
+                dlls_json.push_back(ss.str());
             }
         }
     }
     CloseHandle(hProcess);
 
-    std::sort(dlls.begin(), dlls.end(), [](const auto& a, const auto& b) {
-        return a.first < b.first;
-        });
+    std::sort(dlls_json.begin(), dlls_json.end());
 
     std::stringstream ss;
     ss << "[";
-    for (size_t i = 0; i < dlls.size(); ++i) {
-        ss << "{ \"name\": \"" << dlls[i].first << "\", \"path\": \"" << dlls[i].second << "\" }";
-        if (i < dlls.size() - 1) ss << ",";
+    for (size_t i = 0; i < dlls_json.size(); ++i) {
+        ss << dlls_json[i];
+        if (i < dlls_json.size() - 1) ss << ",";
     }
     ss << "]";
 
     SafeEvalScript("populateDlls(" + ss.str() + ");");
 }
 
-// --- Analyze DLLs using LIEF ---
 void RequestFunctionsForDlls(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
-    if (args.size() < 1 || !args[0].IsObject()) {
+    std::cout << "--- C++: RequestFunctionsForDlls called ---" << std::endl;
+
+    if (args.size() < 1) {
+        std::cout << "[ERROR] No args passed to C++" << std::endl;
+        SafeEvalScript("updateStatus('Error: No arguments passed.', 'bug', 'text-red-400');");
         SafeEvalScript("populateFunctions([]);");
         return;
     }
 
-    ultralight::JSObject jsArray = args[0].ToObject();
-    ultralight::JSValue length_val = jsArray["length"];
-    if (!length_val.IsNumber()) return;
-    int length = (int)length_val.ToNumber();
+    ultralight::JSValue js_arg = args[0];
+
+    if (!js_arg.IsString()) {
+        std::cout << "[ERROR] Argument from JS is not a string. Was it null? " << (js_arg.IsNull() ? "Yes" : "No") << std::endl;
+        SafeEvalScript("updateStatus('Error: Invalid data from UI.', 'bug', 'text-red-400');");
+        SafeEvalScript("populateFunctions([]);");
+        return;
+    }
+
+    std::string path = ultralight::String(js_arg.ToString()).utf8().data();
+    std::cout << "Received path from JS: \"" << path << "\"" << std::endl;
+
+    if (path.empty() || path == "null") {
+        std::cout << "[ERROR] Path from JS is empty or literal 'null'" << std::endl;
+        SafeEvalScript("updateStatus('Error: Received invalid path.', 'alert-circle', 'text-red-400');");
+        SafeEvalScript("populateFunctions([]);");
+        return;
+    }
+
+    size_t start_pos = 0;
+    while ((start_pos = path.find("\\\\", start_pos)) != std::string::npos) {
+        path.replace(start_pos, 2, "\\");
+        start_pos += 1;
+    }
+
+    std::cout << "Path after un-escaping: \"" << path << "\"" << std::endl;
+
+    if (!std::filesystem::exists(path)) {
+        std::cout << "[ERROR] Filesystem check failed. File does not exist at: " << path << std::endl;
+        SafeEvalScript("updateStatus('Error: DLL file not found on disk.', 'alert-circle', 'text-red-400');");
+        SafeEvalScript("populateFunctions([]);");
+        return;
+    }
+
+    std::ifstream test_file(path, std::ios::binary);
+    if (!test_file.is_open()) {
+        std::cout << "[ERROR] File exists but can't be opened. Locked? Permissions?" << std::endl;
+        SafeEvalScript("updateStatus('Error: DLL is locked or inaccessible.', 'lock', 'text-red-400');");
+        SafeEvalScript("populateFunctions([]);");
+        return;
+    }
+    test_file.close();
+    std::cout << "File exists and is accessible. Starting LIEF analysis..." << std::endl;
 
     std::stringstream ss;
     ss << "[";
-    bool first_func = true;
+    std::string filename = std::filesystem::path(path).filename().string();
 
-    for (int i = 0; i < length; ++i) {
-        ultralight::JSValue val = jsArray[std::to_string(i).c_str()];
-        if (!val.IsString()) continue;
+    try {
+        std::unique_ptr<LIEF::PE::Binary> binary = LIEF::PE::Parser::parse(path);
 
-        std::string path = ultralight::String(val.ToString()).utf8().data();
-        std::string filename = std::filesystem::path(path).filename().string();
+        if (!binary) {
+            std::cout << "[ERROR] LIEF failed to parse PE file." << std::endl;
+            SafeEvalScript("updateStatus('Error: Failed to parse PE file.', 'alert-triangle', 'text-red-400');");
+            SafeEvalScript("populateFunctions([]);");
+            return;
+        }
 
-        try {
-            std::unique_ptr<LIEF::PE::Binary> binary = LIEF::PE::Parser::parse(path);
-            if (binary && binary->has_exports()) {
-                LIEF::PE::Export* exp = binary->get_export();
-                if (exp) {
-                    for (const LIEF::PE::ExportEntry& entry : exp->entries()) {
-                        if (!first_func) ss << ",";
-                        // Sanitize the name for JSON
-                        std::string funcName = entry.name();
-                        std::replace(funcName.begin(), funcName.end(), '"', '\'');
+        if (!binary->has_exports()) {
+            std::cout << "LIEF: DLL has no export table." << std::endl;
+            SafeEvalScript("updateStatus('Analysis complete. DLL has no exported functions.', 'info', 'text-primary/80');");
+            SafeEvalScript("populateFunctions([]);");
+            return;
+        }
 
-                        ss << "{ \"name\": \"" << funcName << "\", "
-                            << "\"dll\": \"" << filename << "\", "
-                            << "\"type\": \"Export\", "
-                            << "\"params\": \"(...)_LIEF\" }";
-                        first_func = false;
-                    }
-                }
+        auto entries = binary->get_export()->entries();
+        std::cout << "Found " << entries.size() << " export entries." << std::endl;
+
+        bool first_func = true;
+        for (const LIEF::PE::ExportEntry& entry : entries) {
+            if (!first_func) ss << ",";
+
+            std::string funcName = entry.name();
+            if (funcName.empty()) {
+                funcName = "ordinal_" + std::to_string(entry.ordinal());
             }
+
+            std::replace(funcName.begin(), funcName.end(), '"', '\'');
+            std::replace(funcName.begin(), funcName.end(), '\\', '/');
+
+            ss << "{ \"name\": \"" << funcName << "\", "
+                << "\"dll\": \"" << filename << "\", "
+                << "\"type\": \"Export\", "
+                << "\"params\": \"(...)\" }";
+            first_func = false;
         }
-        catch (const std::exception& e) {
-            std::cerr << "LIEF parsing error for " << path << ": " << e.what() << std::endl;
-        }
+
+    }
+    catch (const std::exception& e) {
+        std::cout << "[FATAL] LIEF Exception: " << e.what() << std::endl;
+        std::string error_msg = e.what();
+        std::replace(error_msg.begin(), error_msg.end(), '\'', ' ');
+        std::replace(error_msg.begin(), error_msg.end(), '"', ' ');
+        SafeEvalScript("updateStatus('LIEF Error: " + error_msg + "', 'alert-triangle', 'text-red-400');");
+        SafeEvalScript("populateFunctions([]);");
+        return;
     }
 
     ss << "]";
+    std::cout << "LIEF analysis complete. Sending data to UI." << std::endl;
     SafeEvalScript("populateFunctions(" + ss.str() + ");");
 }
 
 
-// Called from JS to open a folder selection dialog
 void SelectOutputDirectory(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (SUCCEEDED(hr)) {
@@ -230,7 +298,6 @@ void SelectOutputDirectory(const ultralight::JSObject& thisObject, const ultrali
                     hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszFilePath);
                     if (SUCCEEDED(hr)) {
                         std::string path = to_utf8(pszFilePath);
-                        // Need to escape backslashes for JS string
                         size_t start_pos = 0;
                         while ((start_pos = path.find("\\", start_pos)) != std::string::npos) {
                             path.replace(start_pos, 1, "\\\\");
@@ -246,33 +313,39 @@ void SelectOutputDirectory(const ultralight::JSObject& thisObject, const ultrali
     }
 }
 
-// Called from JS to generate the final project
 void GenerateProject(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
     if (args.size() < 1 || !args[0].IsString()) return;
     std::string options_json = ultralight::String(args[0].ToString()).utf8().data();
 
-    // Here you would parse the JSON, get the selected functions, project name, etc.
-    // and generate the CMakeLists.txt, dllmain.cpp, and other files.
-
     std::cout << "Generating project with options: " << options_json << std::endl;
 
-    // Simulate generation process
     SafeEvalScript("updateStatus('Generating files...', 'cog animate-spin', 'text-accent', 30);");
-    // ... write files ...
     SafeEvalScript("updateStatus('Running CMake...', 'cog animate-spin', 'text-accent', 70);");
-    // ... run cmake command ...
     SafeEvalScript("updateStatus('Project generated successfully!', 'party-popper', 'text-success', 100);");
 }
 
-// Called from JS to close the application
 void CloseApp(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
     PostQuitMessage(0);
+}
+
+void make_console() {
+    if (AllocConsole()) {
+        FILE* p_cout;
+        freopen_s(&p_cout, "CONOUT$", "w", stdout);
+        freopen_s(&p_cout, "CONOUT$", "w", stderr);
+        SetConsoleTitle("Proximo Debug Console");
+        std::cout.clear();
+        std::wcout.clear();
+        std::cerr.clear();
+        std::wcerr.clear();
+        std::cout << "heyo! debug console is on" << std::endl;
+    }
 }
 
 
 int main(int, char**)
 {
-    // Disable LIEF's verbose logging to the console if you don't need it
+    make_console();
     LIEF::logging::disable();
 
     HINSTANCE hInstance = GetModuleHandle(NULL);
@@ -341,7 +414,6 @@ int main(int, char**)
         return 1;
     }
 
-    // *** BIND C++ FUNCTIONS TO JAVASCRIPT ***
     g_ultralight_controller->AddCallback("requestProcessList", &RequestProcessList);
     g_ultralight_controller->AddCallback("requestDllsForProcess", &RequestDllsForProcess);
     g_ultralight_controller->AddCallback("requestFunctionsForDlls", &RequestFunctionsForDlls);
@@ -365,9 +437,8 @@ int main(int, char**)
             font-family: 'Inter', sans-serif;
             background-color: #121212;
             color: #E0E0E0;
-            overflow: hidden; /* Prevent body scroll */
+            overflow: hidden;
         }
-        /* Custom scrollbar for a more integrated look */
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: #1E1E1E; }
         ::-webkit-scrollbar-thumb { background: #4A4A4A; border-radius: 4px; }
@@ -381,6 +452,7 @@ int main(int, char**)
         .bg-accent { background-color: #00BFFF; }
         .bg-success { background-color: #50FA7B; }
         .text-success { color: #50FA7B; }
+        .text-red-400 { color: #FF5555; }
 
         .custom-select, .custom-input {
             background-color: #2a2a2a;
@@ -398,28 +470,60 @@ int main(int, char**)
             background-color: rgba(0, 191, 255, 0.1);
             border-left: 3px solid #00BFFF;
         }
+        
+        #debug-panel {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.9);
+            z-index: 1000;
+            display: none;
+        }
+        
+        .debug-content {
+            background-color: #1a1a1a;
+            border: 1px solid #4a4a4a;
+            max-height: 90vh;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+        }
     </style>
 </head>
 )HTML_PART1";
 
     html_content += R"HTML_PART2(
 <body class="bg-primary text-primary antialiased">
+    <div id="debug-panel" class="flex items-center justify-center p-4">
+        <div class="debug-content w-full max-w-4xl p-6 rounded-lg">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-xl font-bold text-accent">JavaScript Debug Log</h2>
+                <button id="close-debug-btn" class="text-primary/50 hover:text-accent">
+                    <i data-lucide="x" class="w-6 h-6"></i>
+                </button>
+            </div>
+            <div id="debug-content" class="text-green-400 whitespace-pre-wrap"></div>
+        </div>
+    </div>
 
     <div class="flex h-screen max-h-screen relative">
-        <!-- Close Button -->
         <div id="close-btn" class="absolute top-4 right-4 text-primary/50 hover:text-accent cursor-pointer z-50">
             <i data-lucide="x" class="w-6 h-6"></i>
         </div>
+        
+        <div id="debug-btn" class="absolute top-4 right-16 text-primary/50 hover:text-accent cursor-pointer z-50" title="Show JS Debug Info">
+            <i data-lucide="bug" class="w-6 h-6"></i>
+        </div>
 
-        <!-- Left Panel: Controls -->
         <div class="w-1/3 max-w-sm flex flex-col bg-secondary p-6 space-y-6 overflow-y-auto">
-            <!-- Header -->
             <div class="flex-shrink-0">
                 <h1 class="text-2xl font-bold text-primary">Proximo</h1>
                 <div class="h-0.5 w-16 bg-accent mt-2"></div>
             </div>
 
-            <!-- 1. Process Selection -->
             <div class="space-y-2">
                 <label for="process-select" class="text-sm font-semibold text-primary/80">1. Select Process</label>
                 <div class="flex items-center space-x-2">
@@ -437,15 +541,13 @@ int main(int, char**)
                 </div>
             </div>
 
-            <!-- 2. DLL Filtering -->
             <div class="space-y-2 flex-grow flex flex-col min-h-0">
-                <label class="text-sm font-semibold text-primary/80">2. Filter DLLs</label>
+                <label class="text-sm font-semibold text-primary/80">2. Select Target DLL</label>
                 <div id="dll-list-container" class="bg-[#2a2a2a] border border-[#4a4a4a] rounded-md p-3 flex-grow overflow-y-auto">
                     <p class="text-primary/50 text-center py-4">Select a process to see its DLLs.</p>
                 </div>
             </div>
 
-            <!-- 3. Generation Options -->
             <div class="space-y-4 flex-shrink-0">
                 <h3 class="text-sm font-semibold text-primary/80">3. Generation</h3>
                 <div class="space-y-2">
@@ -468,17 +570,20 @@ int main(int, char**)
             </div>
         </div>
 
-        <!-- Right Panel: Data View -->
         <div class="w-2/3 flex-grow flex flex-col p-6">
             <div class="flex-shrink-0">
-                <h2 class="text-xl font-semibold">Functions Overview</h2>
+                 <div class="flex items-center justify-between">
+                      <h2 class="text-xl font-semibold">Functions Overview</h2>
+                      <button id="refresh-funcs-btn" class="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] rounded-md text-primary/80 hover:text-accent">
+                           <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                      </button>
+                 </div>
                 <div class="relative mt-4">
                     <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-primary/40"></i>
                     <input type="text" id="function-search" placeholder="Filter by function or DLL name..." class="custom-input w-full p-3 pl-10 rounded-md">
                 </div>
             </div>
 
-            <!-- Main Data View -->
             <div class="mt-4 flex-grow overflow-y-auto">
                 <table class="w-full text-left text-sm">
                     <thead class="sticky top-0">
@@ -501,7 +606,6 @@ int main(int, char**)
                 </table>
             </div>
 
-            <!-- Status Bar -->
             <div class="flex-shrink-0 mt-4 h-10 flex items-center justify-between bg-secondary p-3 rounded-md">
                 <div class="flex items-center space-x-2">
                     <span id="status-icon"></span>
@@ -517,7 +621,6 @@ int main(int, char**)
 
     html_content += R"HTML_PART3(
     <script>
-        // --- DOM Elements ---
         const processSelect = document.getElementById('process-select');
         const refreshProcsBtn = document.getElementById('refresh-procs-btn');
         const dllListContainer = document.getElementById('dll-list-container');
@@ -532,11 +635,32 @@ int main(int, char**)
         const browseDirBtn = document.getElementById('browse-dir-btn');
         const outputDirInput = document.getElementById('output-dir');
         const projectNameInput = document.getElementById('project-name');
+        const refreshFuncsBtn = document.getElementById('refresh-funcs-btn');
+        const debugBtn = document.getElementById('debug-btn');
+        const debugPanel = document.getElementById('debug-panel');
+        const debugContent = document.getElementById('debug-content');
+        const closeDebugBtn = document.getElementById('close-debug-btn');
 
         let currentFunctions = [];
+        let debugLog = "=== JAVASCRIPT DEBUG LOG ===\n\n";
 
-        // --- UI Update Functions (called from C++) ---
+        function addDebugLog(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            debugLog += `[${timestamp}] ${message}\n`;
+            debugContent.textContent = debugLog;
+        }
+
+        function showDebug() {
+            debugPanel.style.display = 'flex';
+            lucide.createIcons();
+        }
+
+        function hideDebug() {
+            debugPanel.style.display = 'none';
+        }
+
         function populateProcessList(processes) {
+            addDebugLog(`populateProcessList called with ${processes.length} processes`);
             processSelect.innerHTML = '<option value="">Select a running process...</option>';
             processes.forEach(proc => {
                 const option = document.createElement('option');
@@ -548,35 +672,50 @@ int main(int, char**)
         }
 
         function populateDlls(dlls) {
-            if (!dlls || dlls.length === 0) {
-                dllListContainer.innerHTML = `<p class="text-primary/50 text-center py-4">No DLLs found for this process.</p>`;
-                return;
-            }
-            dllListContainer.innerHTML = dlls.map(dll => `
-                <div class="flex items-center space-x-2 p-1.5 rounded hover:bg-[#3a3a3a]">
-                    <input type="checkbox" data-dll-name="${dll.name}" data-dll-path="${dll.path}" class="dll-checkbox h-4 w-4 rounded bg-[#2a2a2a] border-[#4a4a4a] text-accent focus:ring-accent" checked>
-                    <label class="text-sm">${dll.name}</label>
-                </div>
-            `).join('');
-            
-            // After populating DLLs, automatically request their functions
-            requestFunctionsForSelectedDlls();
-        }
+			addDebugLog(`populateDlls called with ${dlls.length} DLLs`);
+			if (!dlls || dlls.length === 0) {
+				dllListContainer.innerHTML = `<p class="text-primary/50 text-center py-4">No DLLs found for this process.</p>`;
+				return;
+			}
+			
+			dllListContainer.innerHTML = dlls.map(dll => {
+				const escapedPath = dll.path.replace(/"/g, '&quot;');
+				const escapedName = dll.name.replace(/"/g, '&quot;');
+				
+				return `
+				<div class="flex items-center space-x-2 p-1.5 rounded hover:bg-[#3a3a3a]">
+					<input type="checkbox" 
+						   data-dll-name="${escapedName}" 
+						   data-dll-path="${escapedPath}" 
+						   class="dll-checkbox h-4 w-4 rounded bg-[#2a2a2a] border-[#4a4a4a] text-accent focus:ring-accent" 
+						   ${dll.selected ? 'checked' : ''}>
+					<label class="text-sm">${escapedName}</label>
+				</div>`;
+			}).join('');
+			
+			requestFunctionsForSelectedDlls();
+		}
 
         function populateFunctions(functions) {
+            addDebugLog(`populateFunctions called with ${functions.length} functions`);
             currentFunctions = functions;
-            renderFunctions(); // Initial render
-            updateStatus(`Analyzed DLLs. Found ${functions.length} functions.`, 'check-circle', 'text-success');
-            setTimeout(() => updateStatus('Ready', '', 'text-primary/80', 0), 3000);
+            renderFunctions();
             checkCanGenerate();
+            
+            if (functions.length > 0) {
+                updateStatus(`Analysis complete. Found ${functions.length} functions.`, 'check-circle', 'text-success');
+                setTimeout(() => updateStatus('Ready', '', 'text-primary/80', 0), 4000);
+            } else if (document.querySelectorAll('.dll-checkbox:checked').length > 0) {
+                updateStatus('Analysis complete. No exported functions found.', 'search-x', 'text-primary/80');
+            }
         }
 
         function setOutputDirectory(path) {
+            addDebugLog(`setOutputDirectory called with path: ${path}`);
             outputDirInput.value = path;
             checkCanGenerate();
         }
 
-        // --- UI Logic ---
         function updateStatus(text, icon = '', colorClass = 'text-primary/80', progress = 0) {
             statusText.textContent = text;
             statusText.className = `text-xs font-medium ${colorClass}`;
@@ -586,15 +725,37 @@ int main(int, char**)
         }
         
         function requestFunctionsForSelectedDlls() {
-            const checkedDllPaths = Array.from(document.querySelectorAll('.dll-checkbox:checked')).map(cb => cb.dataset.dllPath);
-            if (checkedDllPaths.length > 0) {
-                updateStatus('Analyzing DLLs...', 'loader-2 animate-spin', 'text-accent');
-                window.requestFunctionsForDlls(checkedDllPaths);
-            } else {
-                currentFunctions = [];
-                renderFunctions();
-            }
-        }
+			addDebugLog("=== requestFunctionsForSelectedDlls CALLED ===");
+			
+			const checkedBox = document.querySelector('.dll-checkbox:checked');
+			
+			if (checkedBox) {
+				const dllPath = checkedBox.getAttribute('data-dll-path');
+				const dllName = checkedBox.getAttribute('data-dll-name');
+				
+				addDebugLog(`Found selected DLL: "${dllName}" with path: "${dllPath}"`);
+
+				if (dllPath && dllPath !== 'null' && dllPath.length > 0) {
+					addDebugLog(`Calling C++ with string argument: "${dllPath}"`);
+					updateStatus(`Analyzing ${dllName}...`, 'loader-2 animate-spin', 'text-accent', 50);
+					
+					// FIXED: Send the path as a simple string, not an array.
+					window.requestFunctionsForDlls(dllPath); 
+					addDebugLog("Call to C++ completed.");
+				} else {
+					addDebugLog("ERROR: Selected DLL path is invalid.");
+					updateStatus('Error: Selected DLL has no path data.', 'alert-circle', 'text-red-400');
+					populateFunctions([]);
+				}
+			} else {
+				addDebugLog("No DLL is selected.");
+				updateStatus('Ready', '', 'text-primary/80');
+				// clear the function list if nothing is selected
+				populateFunctions([]);
+			}
+			addDebugLog("=== requestFunctionsForSelectedDlls FINISHED ===\n");
+		}
+
 
         function renderFunctions() {
             const checkedDllNames = Array.from(document.querySelectorAll('.dll-checkbox:checked')).map(cb => cb.dataset.dllName);
@@ -606,7 +767,11 @@ int main(int, char**)
             );
 
             if (functionsToRender.length === 0) {
-                functionTableBody.innerHTML = `<tr class="data-grid-row"><td colspan="5" class="text-center p-16 text-primary/50"><i data-lucide="search-x" class="w-12 h-12 mx-auto mb-2"></i><p>No matching functions found.</p></td></tr>`;
+                if (checkedDllNames.length > 0) {
+                     functionTableBody.innerHTML = `<tr class="data-grid-row"><td colspan="5" class="text-center p-16 text-primary/50"><i data-lucide="search-x" class="w-12 h-12 mx-auto mb-2"></i><p>No matching functions found for the selected DLL.</p></td></tr>`;
+                } else {
+                    functionTableBody.innerHTML = `<tr class="data-grid-row"><td colspan="5" class="text-center p-16 text-primary/50"><i data-lucide="list-x" class="w-12 h-12 mx-auto mb-2"></i><p>Select a DLL to see functions.</p></td></tr>`;
+                }
                 lucide.createIcons();
                 return;
             }
@@ -645,20 +810,23 @@ int main(int, char**)
             generateBtn.disabled = !canGenerate;
         }
 
-        // --- Event Listeners ---
+        // Event Listeners
+        debugBtn.addEventListener('click', showDebug);
+        closeDebugBtn.addEventListener('click', hideDebug);
+        
         refreshProcsBtn.addEventListener('click', () => {
+            addDebugLog("Refresh processes button clicked");
             updateStatus('Refreshing process list...', 'loader-2 animate-spin', 'text-accent');
             window.requestProcessList();
         });
 
         processSelect.addEventListener('change', () => {
             const pid = processSelect.value;
-            functionTableBody.innerHTML = '';
+            addDebugLog(`Process selected: PID ${pid}`);
             currentFunctions = [];
+            renderFunctions();
             if (!pid) {
                 dllListContainer.innerHTML = `<p class="text-primary/50 text-center py-4">Select a process to see its DLLs.</p>`;
-                functionTableBody.innerHTML = `<tr class="data-grid-row"><td colspan="5" class="text-center p-16 text-primary/50"><i data-lucide="list-x" class="w-12 h-12 mx-auto mb-2"></i><p>No process selected</p></td></tr>`;
-                lucide.createIcons();
                 checkCanGenerate();
                 return;
             }
@@ -668,8 +836,22 @@ int main(int, char**)
 
         dllListContainer.addEventListener('change', (e) => {
             if (e.target.classList.contains('dll-checkbox')) {
+                addDebugLog(`DLL checkbox changed: ${e.target.dataset.dllName} checked=${e.target.checked}`);
+                // this makes it act like a radio button group only one can be checked
+                if (e.target.checked) {
+                    document.querySelectorAll('.dll-checkbox').forEach(cb => {
+                        if (cb !== e.target) {
+                            cb.checked = false;
+                        }
+                    });
+                }
                 requestFunctionsForSelectedDlls();
             }
+        });
+
+        refreshFuncsBtn.addEventListener('click', () => {
+            addDebugLog("Refresh functions button clicked");
+            requestFunctionsForSelectedDlls();
         });
 
         functionSearch.addEventListener('input', renderFunctions);
@@ -711,8 +893,8 @@ int main(int, char**)
         projectNameInput.addEventListener('input', checkCanGenerate);
         outputDirInput.addEventListener('input', checkCanGenerate);
 
-        // --- Initial Load ---
         window.onload = () => {
+            addDebugLog("Page loaded, initializing...");
             lucide.createIcons();
             updateStatus('Requesting process list...', 'loader-2 animate-spin', 'text-accent');
             window.requestProcessList();

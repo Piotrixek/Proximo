@@ -1,0 +1,100 @@
+The project is a desktop application, let's call it Proximo, designed to automate the process of creating a proxy DLL.
+
+A proxy DLL acts as a middleman. When an application tries to load a legitimate DLL, the proxy DLL intercepts the call, allowing you to execute your own code before forwarding the call to the original DLL. This is useful for various tasks like debugging, monitoring function calls, or injecting custom logic.
+
+The app's main purpose is to remove the manual effort involved in this process. You'll be able to select a running process, and the app will automatically find its DLLs and analyze their functions. From there, you can choose which specific functions you want to proxy. Finally, the app will generate a complete Visual Studio project template with a CMakeLists.txt file, ready to compile a new proxy DLL with all your chosen functions already defined.
+
+
+
+
+
+
+Write HTML code for gui for design for proxy DLL application, now with a modern aesthetic and a specific color palette. The goal is to minimize user clicks and make the entire process feel seamless and powerful.
+Remember to use tailwindcss and lucide for icons. And add some placeholders.
+
+Overall Concept: The Automated Flow
+Instead of a multi-stage wizard, the app will be built around a single, dynamic dashboard. The user will select a process and the app will instantly populate the screen with all the necessary information, ready for the final step of project generation.
+
+Process Selection: User chooses a process from a drop-down list or a search bar.
+
+Instant Analysis: As soon as a process is selected, the application automatically enumerates its DLLs and parses their exports/imports.
+
+Function Filtering & Selection: All functions from all DLLs are displayed in a single, filterable list. The user can filter by DLL name or function name, and then select the functions to be proxied.
+
+One-Click Generation: A single button click generates the CMakeLists.txt file and other necessary project files based on the user's selections.
+
+Color Palette
+The design will use a modern, dark theme with a vibrant, tech-inspired color palette to create a high-contrast and professional look.
+
+Primary Background: A dark charcoal gray (#121212) for the main window and panels.
+
+Secondary Background: A slightly lighter gray (#1E1E1E) for sections, list backgrounds, and text boxes.
+
+Primary Text: A soft white (#E0E0E0) for main text, labels, and titles.
+
+Accent Color: A vibrant electric blue (#00BFFF) for highlights, selected items, progress bars, and key buttons.
+
+Success/Action Color: A clean mint green (#50FA7B) for "Generate Project" and success messages.
+
+Warning/Error Color: A deep orange-red (#FF6347) for warnings and error messages.
+
+Application Layout
+The application will be a single window, horizontally divided into two main sections: a control panel on the left and a data view on the right.
+
+Left Panel: Controls
+This panel will be a static, narrower section on the left side, using the #1E1E1E background. It houses all the user input controls.
+
+Header: "Proxy App" in a modern, clean font with a small accent-colored line underneath.
+
+Process Selection Section:
+
+Label: "1. Select Process"
+
+Control: A drop-down menu or a search bar that auto-completes with running process names. This is where the user's primary action begins.
+
+DLL Filtering Section:
+
+Label: "2. Filter DLLs"
+
+Control: A list box or a list view of all DLLs found in the selected process. Each DLL name should have a small checkbox next to it. This allows the user to narrow down which DLLs they want to see functions for.
+
+Generation Options Section:
+
+Label: "3. Generation"
+
+Text Field: "Project Name:" with a text box.
+
+Text Field: "Output Directory:" with a text box and a browse button.
+
+Checkbox: "Generate VS Project files"
+
+Button: A large, prominent "Generate Project" button with a mint green background, ready to be clicked when the user is done with their selections.
+
+Right Panel: Data View
+This panel will be the larger, dynamic part of the window, using the #121212 background. It's where the user sees all the analyzed data.
+
+Header: "Functions Overview"
+
+Search Bar: A prominent search bar at the top of this panel. This will be the main way to filter the huge list of functions. The search will be live, updating the list as the user types.
+
+Main Data View: A single DataGrid that displays all the functions (exports and imports) from the selected DLLs. This is the heart of the automated design.
+
+Columns:
+
+Checkbox: For selecting the function to be proxied.
+
+Function Name: The name of the function.
+
+DLL Name: The name of the original DLL.
+
+Type: An icon or text indicating if it's an "Export" or "Import."
+
+Parameters: A brief description or string of the parameters (if parsable).
+
+Status Bar/Log: A small area at the bottom of the right panel that provides real-time feedback.
+
+Status Text: "Ready," "Analyzing...", "Generating Project..."
+
+Progress Bar: A thin progress bar that activates during the analysis or generation phase.
+
+This design consolidates all the information and controls into a single, cohesive view. The automation happens in the background, making the user's experience feel more like they are commanding a powerful tool rather than navigating a tedious process.

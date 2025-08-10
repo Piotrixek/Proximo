@@ -57,6 +57,42 @@ std::string to_utf8(const std::wstring& wstr) {
     return strTo;
 }
 
+void CopyToClipboard(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
+    if (args.size() < 1 || !args[0].IsString()) {
+        std::cout << "[ERROR] copyToClipboard called with invalid arguments." << std::endl;
+        return;
+    }
+
+    std::string text_to_copy = ultralight::String(args[0].ToString()).utf8().data();
+
+    if (!OpenClipboard(NULL)) {
+        std::cout << "[ERROR] Cannot open the Clipboard." << std::endl;
+        return;
+    }
+
+    EmptyClipboard();
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, text_to_copy.size() + 1);
+    if (!hg) {
+        CloseClipboard();
+        std::cout << "[ERROR] Cannot allocate memory for clipboard." << std::endl;
+        return;
+    }
+
+    LPSTR dest = (LPSTR)GlobalLock(hg);
+    if (dest) {
+        strcpy_s(dest, text_to_copy.size() + 1, text_to_copy.c_str());
+        GlobalUnlock(hg);
+        SetClipboardData(CF_TEXT, hg);
+    }
+    else {
+        GlobalFree(hg); // clean up if lock fails
+    }
+
+    CloseClipboard();
+    std::cout << "Successfully copied " << text_to_copy.size() << " bytes to clipboard." << std::endl;
+}
+
+
 void RequestProcessList(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
     std::vector<std::pair<DWORD, std::string>> processes;
     DWORD aProcesses[1024], cbNeeded, cProcesses;
@@ -183,86 +219,28 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
     SafeEvalScript("populateDlls(" + ss.str() + ");");
 }
 
-void RequestFunctionsForDlls(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
-    std::cout << "--- C++: RequestFunctionsForDlls called ---" << std::endl;
-
-    if (args.size() < 1) {
-        std::cout << "[ERROR] No args passed to C++" << std::endl;
-        SafeEvalScript("updateStatus('Error: No arguments passed.', 'bug', 'text-red-400');");
-        SafeEvalScript("populateFunctions([]);");
-        return;
-    }
-
-    ultralight::JSValue js_arg = args[0];
-
-    if (!js_arg.IsString()) {
-        std::cout << "[ERROR] Argument from JS is not a string. Was it null? " << (js_arg.IsNull() ? "Yes" : "No") << std::endl;
-        SafeEvalScript("updateStatus('Error: Invalid data from UI.', 'bug', 'text-red-400');");
-        SafeEvalScript("populateFunctions([]);");
-        return;
-    }
-
-    std::string path = ultralight::String(js_arg.ToString()).utf8().data();
-    std::cout << "Received path from JS: \"" << path << "\"" << std::endl;
-
-    if (path.empty() || path == "null") {
-        std::cout << "[ERROR] Path from JS is empty or literal 'null'" << std::endl;
-        SafeEvalScript("updateStatus('Error: Received invalid path.', 'alert-circle', 'text-red-400');");
-        SafeEvalScript("populateFunctions([]);");
-        return;
-    }
-
+std::string getFunctionsAsJsonString(std::string& path) {
     size_t start_pos = 0;
     while ((start_pos = path.find("\\\\", start_pos)) != std::string::npos) {
         path.replace(start_pos, 2, "\\");
         start_pos += 1;
     }
 
-    std::cout << "Path after un-escaping: \"" << path << "\"" << std::endl;
-
     if (!std::filesystem::exists(path)) {
-        std::cout << "[ERROR] Filesystem check failed. File does not exist at: " << path << std::endl;
-        SafeEvalScript("updateStatus('Error: DLL file not found on disk.', 'alert-circle', 'text-red-400');");
-        SafeEvalScript("populateFunctions([]);");
-        return;
+        return "";
     }
-
-    std::ifstream test_file(path, std::ios::binary);
-    if (!test_file.is_open()) {
-        std::cout << "[ERROR] File exists but can't be opened. Locked? Permissions?" << std::endl;
-        SafeEvalScript("updateStatus('Error: DLL is locked or inaccessible.', 'lock', 'text-red-400');");
-        SafeEvalScript("populateFunctions([]);");
-        return;
-    }
-    test_file.close();
-    std::cout << "File exists and is accessible. Starting LIEF analysis..." << std::endl;
 
     std::stringstream ss;
-    ss << "[";
     std::string filename = std::filesystem::path(path).filename().string();
 
     try {
         std::unique_ptr<LIEF::PE::Binary> binary = LIEF::PE::Parser::parse(path);
-
-        if (!binary) {
-            std::cout << "[ERROR] LIEF failed to parse PE file." << std::endl;
-            SafeEvalScript("updateStatus('Error: Failed to parse PE file.', 'alert-triangle', 'text-red-400');");
-            SafeEvalScript("populateFunctions([]);");
-            return;
+        if (!binary || !binary->has_exports()) {
+            return "";
         }
-
-        if (!binary->has_exports()) {
-            std::cout << "LIEF: DLL has no export table." << std::endl;
-            SafeEvalScript("updateStatus('Analysis complete. DLL has no exported functions.', 'info', 'text-primary/80');");
-            SafeEvalScript("populateFunctions([]);");
-            return;
-        }
-
-        auto entries = binary->get_export()->entries();
-        std::cout << "Found " << entries.size() << " export entries." << std::endl;
 
         bool first_func = true;
-        for (const LIEF::PE::ExportEntry& entry : entries) {
+        for (const LIEF::PE::ExportEntry& entry : binary->get_export()->entries()) {
             if (!first_func) ss << ",";
 
             std::string funcName = entry.name();
@@ -279,21 +257,50 @@ void RequestFunctionsForDlls(const ultralight::JSObject& thisObject, const ultra
                 << "\"params\": \"(...)\" }";
             first_func = false;
         }
-
     }
-    catch (const std::exception& e) {
-        std::cout << "[FATAL] LIEF Exception: " << e.what() << std::endl;
-        std::string error_msg = e.what();
-        std::replace(error_msg.begin(), error_msg.end(), '\'', ' ');
-        std::replace(error_msg.begin(), error_msg.end(), '"', ' ');
-        SafeEvalScript("updateStatus('LIEF Error: " + error_msg + "', 'alert-triangle', 'text-red-400');");
+    catch (const std::exception&) {
+        return "";
+    }
+
+    return ss.str();
+}
+
+void RequestFunctionsForDlls(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
+    if (args.size() < 1 || !args[0].IsString()) {
         SafeEvalScript("populateFunctions([]);");
         return;
     }
+    std::string path = ultralight::String(args[0].ToString()).utf8().data();
+    std::string functions_json = getFunctionsAsJsonString(path);
+    SafeEvalScript("populateFunctions([" + functions_json + "]);");
+}
 
-    ss << "]";
-    std::cout << "LIEF analysis complete. Sending data to UI." << std::endl;
-    SafeEvalScript("populateFunctions(" + ss.str() + ");");
+void RequestFunctionsForMultipleDlls(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
+    if (args.size() < 1 || !args[0].IsArray()) {
+        SafeEvalScript("populateReportData([]);");
+        return;
+    }
+
+    ultralight::JSArray dllPathsArray = args[0].ToArray();
+    std::stringstream aggregated_results;
+    aggregated_results << "[";
+    bool first_entry = true;
+
+    for (size_t i = 0; i < dllPathsArray.length(); ++i) {
+        std::string path = ultralight::String(dllPathsArray[i].ToString()).utf8().data();
+        std::string functions_json = getFunctionsAsJsonString(path);
+
+        if (!functions_json.empty()) {
+            if (!first_entry) {
+                aggregated_results << ",";
+            }
+            aggregated_results << functions_json;
+            first_entry = false;
+        }
+    }
+
+    aggregated_results << "]";
+    SafeEvalScript("populateReportData(" + aggregated_results.str() + ");");
 }
 
 
@@ -568,9 +575,11 @@ int main(int, char**)
     g_ultralight_controller->AddCallback("requestProcessList", &RequestProcessList);
     g_ultralight_controller->AddCallback("requestDllsForProcess", &RequestDllsForProcess);
     g_ultralight_controller->AddCallback("requestFunctionsForDlls", &RequestFunctionsForDlls);
+    g_ultralight_controller->AddCallback("requestFunctionsForMultipleDlls", &RequestFunctionsForMultipleDlls);
     g_ultralight_controller->AddCallback("selectOutputDirectory", &SelectOutputDirectory);
     g_ultralight_controller->AddCallback("generateProject", &GenerateProject);
     g_ultralight_controller->AddCallback("closeApp", &CloseApp);
+    g_ultralight_controller->AddCallback("copyToClipboard", &CopyToClipboard);
 
 
     std::string html_content = R"HTML_PART1(
@@ -725,9 +734,14 @@ int main(int, char**)
             <div class="flex-shrink-0">
                  <div class="flex items-center justify-between">
                       <h2 class="text-xl font-semibold">Functions Overview</h2>
-                      <button id="refresh-funcs-btn" class="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] rounded-md text-primary/80 hover:text-accent">
-                           <i data-lucide="refresh-cw" class="w-4 h-4"></i>
-                      </button>
+                      <div class="flex items-center space-x-2">
+                          <button id="generate-report-btn" class="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] rounded-md text-primary/80 hover:text-accent" title="Generate & Copy Report">
+                               <i data-lucide="clipboard-list" class="w-4 h-4"></i>
+                          </button>
+                          <button id="refresh-funcs-btn" class="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] rounded-md text-primary/80 hover:text-accent" title="Refresh Functions">
+                               <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                          </button>
+                      </div>
                  </div>
                 <div class="relative mt-4">
                     <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-primary/40"></i>
@@ -787,12 +801,14 @@ int main(int, char**)
         const outputDirInput = document.getElementById('output-dir');
         const projectNameInput = document.getElementById('project-name');
         const refreshFuncsBtn = document.getElementById('refresh-funcs-btn');
+        const generateReportBtn = document.getElementById('generate-report-btn');
         const debugBtn = document.getElementById('debug-btn');
         const debugPanel = document.getElementById('debug-panel');
         const debugContent = document.getElementById('debug-content');
         const closeDebugBtn = document.getElementById('close-debug-btn');
 
         let currentFunctions = [];
+        let reportFunctions = [];
         let currentDllPath = ''; // store the path of the selected dll
         let debugLog = "=== JAVASCRIPT DEBUG LOG ===\n\n";
 
@@ -861,6 +877,70 @@ int main(int, char**)
                 setTimeout(() => updateStatus('Ready', '', 'text-primary/80', 0), 4000);
             } else if (document.querySelectorAll('.dll-checkbox:checked').length > 0) {
                 updateStatus('Analysis complete. No exported functions found.', 'search-x', 'text-primary/80');
+            }
+        }
+        
+        function populateReportData(functions) {
+            addDebugLog(`Received data for report with ${functions.length} total functions.`);
+            reportFunctions = functions;
+            formatAndCopyReport();
+        }
+        
+        function formatAndCopyReport() {
+            if (reportFunctions.length === 0) {
+                updateStatus('No functions found in selected DLLs to report.', 'alert-circle', 'text-primary/80');
+                setTimeout(() => updateStatus('Ready', '', 'text-primary/80'), 3000);
+                return;
+            }
+
+            const dllsToReport = reportFunctions.reduce((acc, func) => {
+                if (!acc[func.dll]) {
+                    acc[func.dll] = [];
+                }
+                acc[func.dll].push(func);
+                return acc;
+            }, {});
+
+            let reportText = `Proximo DLL & Function Report\nGenerated on: ${new Date().toLocaleString()}\n\n`;
+
+            for (const dllName in dllsToReport) {
+                reportText += `--- DLL: ${dllName} ---\n`;
+                
+                const functionsForDll = dllsToReport[dllName];
+                const functionsToShow = functionsForDll.slice(0, 10);
+                
+                functionsToShow.forEach(func => {
+                    reportText += `- Function: ${(func.name || '').padEnd(40)} | Type: ${(func.type || '').padEnd(8)} | Params: ${func.params}\n`;
+                });
+                
+                if (functionsForDll.length > 10) {
+                    reportText += `...and ${functionsForDll.length - 10} more functions.\n`;
+                }
+                reportText += '\n';
+            }
+
+            window.copyToClipboard(reportText);
+            addDebugLog('Report passed to C++ for copying.');
+            updateStatus('Report copied to clipboard!', 'copy', 'text-success');
+            setTimeout(() => updateStatus('Ready', '', 'text-primary/80'), 3000);
+        }
+
+        function generateAndCopyReport() {
+            addDebugLog('Generate report button clicked');
+            
+            const dllCheckboxes = document.querySelectorAll('.dll-checkbox:not([disabled])');
+            if (dllCheckboxes.length === 0) {
+                updateStatus('No proxyable DLLs found to report on.', 'alert-circle', 'text-red-400');
+                setTimeout(() => updateStatus('Ready', '', 'text-primary/80'), 3000);
+                return;
+            }
+            
+            const allProxyableDllPaths = Array.from(dllCheckboxes)
+                                              .map(cb => cb.getAttribute('data-dll-path'));
+
+            if (allProxyableDllPaths.length > 0) {
+                updateStatus(`Analyzing ${allProxyableDllPaths.length} DLLs for report...`, 'loader-2 animate-spin', 'text-accent');
+                window.requestFunctionsForMultipleDlls(allProxyableDllPaths);
             }
         }
 
@@ -965,7 +1045,6 @@ int main(int, char**)
             generateBtn.disabled = !canGenerate;
         }
 
-        // Event Listeners
         debugBtn.addEventListener('click', showDebug);
         closeDebugBtn.addEventListener('click', hideDebug);
         
@@ -992,7 +1071,7 @@ int main(int, char**)
         dllListContainer.addEventListener('change', (e) => {
             if (e.target.classList.contains('dll-checkbox')) {
                 addDebugLog(`DLL checkbox changed: ${e.target.dataset.dllName} checked=${e.target.checked}`);
-                // this makes it act like a radio button group only one can be checked
+                
                 if (e.target.checked) {
                     document.querySelectorAll('.dll-checkbox').forEach(cb => {
                         if (cb !== e.target) {
@@ -1008,6 +1087,8 @@ int main(int, char**)
             addDebugLog("Refresh functions button clicked");
             requestFunctionsForSelectedDlls();
         });
+
+        generateReportBtn.addEventListener('click', generateAndCopyReport);
 
         functionSearch.addEventListener('input', renderFunctions);
         

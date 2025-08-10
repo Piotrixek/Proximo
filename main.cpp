@@ -35,6 +35,10 @@
 #include <LIEF/PE.hpp>
 #include <LIEF/logging.hpp>
 #include "menu.h"
+#include "json.hpp" // use the json library
+
+// for convenience
+using json = nlohmann::json;
 
 std::unique_ptr<UltralightController> g_ultralight_controller;
 
@@ -314,15 +318,144 @@ void SelectOutputDirectory(const ultralight::JSObject& thisObject, const ultrali
 }
 
 void GenerateProject(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
-    if (args.size() < 1 || !args[0].IsString()) return;
-    std::string options_json = ultralight::String(args[0].ToString()).utf8().data();
+    SafeEvalScript("updateStatus('Starting project generation...', 'cog', 'text-accent', 10);");
 
-    std::cout << "Generating project with options: " << options_json << std::endl;
+    if (args.size() < 1 || !args[0].IsString()) {
+        SafeEvalScript("updateStatus('Error: Invalid args for generation.', 'bug', 'text-red-400', 0);");
+        return;
+    }
+    std::string options_str = ultralight::String(args[0].ToString()).utf8().data();
+    std::cout << "Generating project with options: " << options_str << std::endl;
 
-    SafeEvalScript("updateStatus('Generating files...', 'cog animate-spin', 'text-accent', 30);");
-    SafeEvalScript("updateStatus('Running CMake...', 'cog animate-spin', 'text-accent', 70);");
-    SafeEvalScript("updateStatus('Project generated successfully!', 'party-popper', 'text-success', 100);");
+    try {
+        json opts = json::parse(options_str);
+        std::string projectName = opts["projectName"];
+        std::string outputDirStr = opts["outputDir"];
+        std::string targetDllPathStr = opts["targetDllPath"];
+
+        // unescape the paths
+        std::filesystem::path outputDir(outputDirStr);
+        std::filesystem::path targetDllPath(targetDllPathStr);
+
+        // create the output directory
+        std::filesystem::create_directories(outputDir);
+        SafeEvalScript("updateStatus('Created project directory...', 'folder-plus', 'text-accent', 25);");
+
+        // get all exports from the original dll using lief
+        auto original_binary = LIEF::PE::Parser::parse(targetDllPath.string());
+        if (!original_binary || !original_binary->has_exports()) {
+            SafeEvalScript("updateStatus('Error: Could not analyze target DLL.', 'alert-triangle', 'text-red-400', 0);");
+            return;
+        }
+
+        std::set<std::string> selected_func_names;
+        for (const auto& func : opts["functions"]) {
+            selected_func_names.insert(func["name"]);
+        }
+
+        std::vector<LIEF::PE::ExportEntry> selected_exports;
+        for (const auto& entry : original_binary->get_export()->entries()) {
+            if (selected_func_names.count(entry.name())) {
+                selected_exports.push_back(entry);
+            }
+        }
+
+        // --- Generate CMakeLists.txt ---
+        std::ofstream cmake_file(outputDir / "CMakeLists.txt");
+        cmake_file << "cmake_minimum_required(VERSION 3.15)\n"
+            << "project(" << projectName << " LANGUAGES CXX)\n\n"
+            << "set(CMAKE_CXX_STANDARD 17)\n"
+            << "set(CMAKE_CXX_STANDARD_REQUIRED True)\n\n"
+            << "add_library(" << projectName << " SHARED\n"
+            << "    dllmain.cpp\n"
+            << "    proxy.cpp\n"
+            << ")\n\n"
+            << "if(MSVC)\n"
+            << "    set_target_properties(" << projectName << " PROPERTIES\n"
+            << "        LINK_FLAGS \"/DEF:${CMAKE_CURRENT_SOURCE_DIR}/" << projectName << ".def\"\n"
+            << "    )\n"
+            << "endif()";
+        cmake_file.close();
+        SafeEvalScript("updateStatus('Generating build system...', 'wrench', 'text-accent', 40);");
+
+        // --- Generate .def file ---
+        std::ofstream def_file(outputDir / (projectName + ".def"));
+        def_file << "LIBRARY " << projectName << "\n";
+        def_file << "EXPORTS\n";
+        for (const auto& entry : selected_exports) {
+            def_file << "    " << entry.name() << " @" << entry.ordinal() << "\n";
+        }
+        def_file.close();
+
+        // --- Generate proxy.h ---
+        std::ofstream proxy_h_file(outputDir / "proxy.h");
+        proxy_h_file << "#pragma once\n"
+            << "#include <windows.h>\n\n";
+        for (const auto& entry : selected_exports) {
+            proxy_h_file << "extern FARPROC pfn" << entry.name() << ";\n";
+        }
+        proxy_h_file.close();
+
+        // --- Generate dllmain.cpp ---
+        std::string originalDllName = targetDllPath.stem().string() + "_original.dll";
+        std::ofstream dllmain_file(outputDir / "dllmain.cpp");
+        dllmain_file << "#include \"proxy.h\"\n"
+            << "#include <string>\n\n"
+            << "HMODULE hOriginalDll = NULL;\n"
+            << "const std::string originalDllName = \"" << originalDllName << "\";\n\n";
+        for (const auto& entry : selected_exports) {
+            dllmain_file << "FARPROC pfn" << entry.name() << " = NULL;\n";
+        }
+        dllmain_file << "\nvoid InitializeProxies(HMODULE hMod) {\n";
+        for (const auto& entry : selected_exports) {
+            dllmain_file << "    pfn" << entry.name() << " = GetProcAddress(hMod, \"" << entry.name() << "\");\n";
+        }
+        dllmain_file << "}\n\n"
+            << "BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {\n"
+            << "    switch (ul_reason_for_call) {\n"
+            << "        case DLL_PROCESS_ATTACH:\n"
+            << "            DisableThreadLibraryCalls(hModule);\n"
+            << "            hOriginalDll = LoadLibraryA(originalDllName.c_str());\n"
+            << "            if (hOriginalDll) {\n"
+            << "                InitializeProxies(hOriginalDll);\n"
+            << "            } else {\n"
+            << "                MessageBoxA(NULL, \"Failed to load original DLL.\", \"Proxy Error\", MB_OK | MB_ICONERROR);\n"
+            << "                return FALSE;\n"
+            << "            }\n"
+            << "            break;\n"
+            << "        case DLL_PROCESS_DETACH:\n"
+            << "            if (hOriginalDll) FreeLibrary(hOriginalDll);\n"
+            << "            break;\n"
+            << "    }\n"
+            << "    return TRUE;\n"
+            << "}";
+        dllmain_file.close();
+        SafeEvalScript("updateStatus('Generating source files...', 'file-code', 'text-accent', 70);");
+
+        // --- Generate proxy.cpp ---
+        std::ofstream proxy_cpp_file(outputDir / "proxy.cpp");
+        proxy_cpp_file << "#include \"proxy.h\"\n\n";
+        for (const auto& entry : selected_exports) {
+            proxy_cpp_file << "extern \"C\" __declspec(naked) void " << entry.name() << "() {\n"
+                << "    __asm { jmp pfn" << entry.name() << " }\n"
+                << "}\n\n";
+        }
+        proxy_cpp_file.close();
+
+        SafeEvalScript("updateStatus('Project generated successfully!', 'party-popper', 'text-success', 100);");
+        std::cout << "Project generated successfully in " << outputDirStr << std::endl;
+
+    }
+    catch (const json::exception& e) {
+        std::cout << "[FATAL] JSON parsing error: " << e.what() << std::endl;
+        SafeEvalScript("updateStatus('Error: Failed to parse generation options.', 'bug', 'text-red-400', 0);");
+    }
+    catch (const std::exception& e) {
+        std::cout << "[FATAL] File generation error: " << e.what() << std::endl;
+        SafeEvalScript("updateStatus('Error: Could not write project files.', 'file-x', 'text-red-400', 0);");
+    }
 }
+
 
 void CloseApp(const ultralight::JSObject& thisObject, const ultralight::JSArgs& args) {
     PostQuitMessage(0);
@@ -642,6 +775,7 @@ int main(int, char**)
         const closeDebugBtn = document.getElementById('close-debug-btn');
 
         let currentFunctions = [];
+        let currentDllPath = ''; // store the path of the selected dll
         let debugLog = "=== JAVASCRIPT DEBUG LOG ===\n\n";
 
         function addDebugLog(message) {
@@ -732,6 +866,7 @@ int main(int, char**)
 			if (checkedBox) {
 				const dllPath = checkedBox.getAttribute('data-dll-path');
 				const dllName = checkedBox.getAttribute('data-dll-name');
+                currentDllPath = dllPath; // save for project generation
 				
 				addDebugLog(`Found selected DLL: "${dllName}" with path: "${dllPath}"`);
 
@@ -739,18 +874,18 @@ int main(int, char**)
 					addDebugLog(`Calling C++ with string argument: "${dllPath}"`);
 					updateStatus(`Analyzing ${dllName}...`, 'loader-2 animate-spin', 'text-accent', 50);
 					
-					// FIXED: Send the path as a simple string, not an array.
 					window.requestFunctionsForDlls(dllPath); 
 					addDebugLog("Call to C++ completed.");
 				} else {
 					addDebugLog("ERROR: Selected DLL path is invalid.");
+                    currentDllPath = '';
 					updateStatus('Error: Selected DLL has no path data.', 'alert-circle', 'text-red-400');
 					populateFunctions([]);
 				}
 			} else {
 				addDebugLog("No DLL is selected.");
+                currentDllPath = '';
 				updateStatus('Ready', '', 'text-primary/80');
-				// clear the function list if nothing is selected
 				populateFunctions([]);
 			}
 			addDebugLog("=== requestFunctionsForSelectedDlls FINISHED ===\n");
@@ -837,7 +972,6 @@ int main(int, char**)
         dllListContainer.addEventListener('change', (e) => {
             if (e.target.classList.contains('dll-checkbox')) {
                 addDebugLog(`DLL checkbox changed: ${e.target.dataset.dllName} checked=${e.target.checked}`);
-                // this makes it act like a radio button group only one can be checked
                 if (e.target.checked) {
                     document.querySelectorAll('.dll-checkbox').forEach(cb => {
                         if (cb !== e.target) {
@@ -882,6 +1016,7 @@ int main(int, char**)
             const options = {
                 projectName: projectNameInput.value,
                 outputDir: outputDirInput.value,
+                targetDllPath: currentDllPath, // send the full path
                 functions: selectedFunctions
             };
 

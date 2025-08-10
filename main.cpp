@@ -143,10 +143,40 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
     DWORD processID = static_cast<DWORD>(args[0].ToNumber());
 
     const std::set<std::string> system_dlls = {
+        // Core OS and C Runtime
         "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll", "gdi32.dll",
-        "advapi32.dll", "comctl32.dll", "comdlg32.dll", "shell32.dll", "ole32.dll",
-        "oleaut32.dll", "rpcrt4.dll", "ws2_32.dll", "msvcrt.dll", "ucrtbase.dll",
-        "sechost.dll", "shlwapi.dll", "crypt32.dll", "bcrypt.dll", "win32u.dll"
+        "advapi32.dll", "msvcrt.dll", "ucrtbase.dll", "combase.dll", "rpcrt4.dll",
+        // Windows Subsystems and Services
+        "sechost.dll", "comctl32.dll", "shell32.dll", "shlwapi.dll", "win32u.dll",
+        "gdi32full.dll", "msvcp_win.dll", "shcore.dll", "uxtheme.dll",
+        // WoW64 (32-bit on 64-bit Windows)
+        "wow64.dll", "wow64cpu.dll", "wow64win.dll",
+        // Security and Cryptography
+        "crypt32.dll", "bcrypt.dll", "bcryptprimitives.dll", "sspicli.dll", "cryptsp.dll",
+        // Networking
+        "winhttp.dll", "urlmon.dll", "wininet.dll"
+    };
+
+    const std::set<std::string> good_dlls = {
+        // Graphics APIs (for overlays, rendering hooks)
+        "d3d8.dll", "d3d9.dll", "d3d10.dll", "d3d11.dll", "d3d12.dll",
+        "dxgi.dll", "opengl32.dll", "glu32.dll", "ddraw.dll",
+        "d3dcompiler_43.dll", "d3dcompiler_47.dll",
+
+        // Input APIs (for input hooks, macros)
+        "dinput.dll", "dinput8.dll",
+        "xinput1_4.dll", "xinput1_3.dll", "xinput1_2.dll", "xinput1_1.dll", "xinput9_1_0.dll",
+
+        // Audio APIs (for audio hooks)
+        "dsound.dll", "xaudio2_9.dll", "xaudio2_8.dll", "xaudio2_7.dll",
+
+        // Networking (for packet manipulation)
+        "ws2_32.dll",
+
+        // Common Game/Modding Targets (often safe for early injection)
+        "winmm.dll", "version.dll",
+        "binkw32.dll", "binkw64.dll",
+        "steam_api.dll", "steam_api64.dll"
     };
 
     std::vector<std::string> dlls_json;
@@ -174,10 +204,17 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
                 std::string lowerDllName = dllName;
                 std::transform(lowerDllName.begin(), lowerDllName.end(), lowerDllName.begin(), ::tolower);
 
-                bool is_system_dll = system_dlls.count(lowerDllName) > 0;
-                bool is_potential_selection = !is_system_dll;
+                std::string dllCategory = "neutral";
+                if (system_dlls.count(lowerDllName) > 0) {
+                    dllCategory = "system";
+                }
+                else if (good_dlls.count(lowerDllName) > 0) {
+                    dllCategory = "good";
+                }
+
+                bool is_selectable = (dllCategory != "system");
                 bool is_selected = false;
-                if (is_potential_selection && !first_selectable_found) {
+                if (is_selectable && !first_selectable_found) {
                     is_selected = true;
                     first_selectable_found = true;
                 }
@@ -191,7 +228,7 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
                 std::stringstream ss;
                 ss << "{ \"name\": \"" << dllName << "\", \"path\": \"" << dllPath
                     << "\", \"selected\": " << (is_selected ? "true" : "false")
-                    << ", \"isSystem\": " << (is_system_dll ? "true" : "false") << " }";
+                    << ", \"category\": \"" << dllCategory << "\" }";
                 dlls_json.push_back(ss.str());
             }
         }
@@ -199,9 +236,9 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
     CloseHandle(hProcess);
 
     std::sort(dlls_json.begin(), dlls_json.end(), [](const std::string& a, const std::string& b) {
-        // this sort puts non-system dlls first
-        bool a_is_system = a.find("\"isSystem\": true") != std::string::npos;
-        bool b_is_system = b.find("\"isSystem\": true") != std::string::npos;
+        // this sort puts good/neutral dlls first
+        bool a_is_system = a.find("\"category\": \"system\"") != std::string::npos;
+        bool b_is_system = b.find("\"category\": \"system\"") != std::string::npos;
         if (a_is_system != b_is_system) {
             return !a_is_system;
         }
@@ -613,6 +650,7 @@ int main(int, char**)
         .bg-success { background-color: #50FA7B; }
         .text-success { color: #50FA7B; }
         .text-red-400 { color: #FF5555; }
+        .text-green-400 { color: #4ADE80; }
 
         .custom-select, .custom-input {
             background-color: #2a2a2a;
@@ -849,8 +887,23 @@ int main(int, char**)
 			dllListContainer.innerHTML = dlls.map(dll => {
 				const escapedPath = dll.path.replace(/"/g, '&quot;');
 				const escapedName = dll.name.replace(/"/g, '&quot;');
-                const isSystemClass = dll.isSystem ? 'text-red-400' : '';
-                const isDisabled = dll.isSystem ? 'disabled' : '';
+                
+                let labelClass = '';
+                let isDisabled = false;
+                switch(dll.category) {
+                    case 'system':
+                        labelClass = 'text-red-400';
+                        isDisabled = true;
+                        break;
+                    case 'good':
+                        labelClass = 'text-green-400';
+                        break;
+                    case 'neutral':
+                    default:
+                        labelClass = '';
+                        break;
+                }
+                const disabledAttr = isDisabled ? 'disabled' : '';
 				
 				return `
 				<div class="flex items-center space-x-2 p-1.5 rounded hover:bg-[#3a3a3a]">
@@ -858,8 +911,8 @@ int main(int, char**)
 						   data-dll-name="${escapedName}" 
 						   data-dll-path="${escapedPath}" 
 						   class="dll-checkbox h-4 w-4 rounded bg-[#2a2a2a] border-[#4a4a4a] text-accent focus:ring-accent" 
-						   ${dll.selected ? 'checked' : ''} ${isDisabled}>
-					<label class="text-sm ${isSystemClass}">${escapedName}</label>
+						   ${dll.selected ? 'checked' : ''} ${disabledAttr}>
+					<label class="text-sm ${labelClass}">${escapedName}</label>
 				</div>`;
 			}).join('');
 			
@@ -950,6 +1003,9 @@ int main(int, char**)
             checkCanGenerate();
         }
 
+)HTML_PART3";
+
+    html_content += R"HTML_PART4(
         function updateStatus(text, icon = '', colorClass = 'text-primary/80', progress = 0) {
             statusText.textContent = text;
             statusText.className = `text-xs font-medium ${colorClass}`;
@@ -1045,6 +1101,7 @@ int main(int, char**)
             generateBtn.disabled = !canGenerate;
         }
 
+        // Event Listeners
         debugBtn.addEventListener('click', showDebug);
         closeDebugBtn.addEventListener('click', hideDebug);
         
@@ -1139,7 +1196,7 @@ int main(int, char**)
     </script>
 </body>
 </html>
-)HTML_PART3";
+)HTML_PART4";
 
 
     g_ultralight_controller->LoadHTML(html_content);

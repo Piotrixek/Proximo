@@ -138,7 +138,8 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
                 std::string lowerDllName = dllName;
                 std::transform(lowerDllName.begin(), lowerDllName.end(), lowerDllName.begin(), ::tolower);
 
-                bool is_potential_selection = system_dlls.find(lowerDllName) == system_dlls.end();
+                bool is_system_dll = system_dlls.count(lowerDllName) > 0;
+                bool is_potential_selection = !is_system_dll;
                 bool is_selected = false;
                 if (is_potential_selection && !first_selectable_found) {
                     is_selected = true;
@@ -152,14 +153,24 @@ void RequestDllsForProcess(const ultralight::JSObject& thisObject, const ultrali
                 }
 
                 std::stringstream ss;
-                ss << "{ \"name\": \"" << dllName << "\", \"path\": \"" << dllPath << "\", \"selected\": " << (is_selected ? "true" : "false") << " }";
+                ss << "{ \"name\": \"" << dllName << "\", \"path\": \"" << dllPath
+                    << "\", \"selected\": " << (is_selected ? "true" : "false")
+                    << ", \"isSystem\": " << (is_system_dll ? "true" : "false") << " }";
                 dlls_json.push_back(ss.str());
             }
         }
     }
     CloseHandle(hProcess);
 
-    std::sort(dlls_json.begin(), dlls_json.end());
+    std::sort(dlls_json.begin(), dlls_json.end(), [](const std::string& a, const std::string& b) {
+        // this sort puts non-system dlls first
+        bool a_is_system = a.find("\"isSystem\": true") != std::string::npos;
+        bool b_is_system = b.find("\"isSystem\": true") != std::string::npos;
+        if (a_is_system != b_is_system) {
+            return !a_is_system;
+        }
+        return a < b;
+        });
 
     std::stringstream ss;
     ss << "[";
@@ -333,15 +344,12 @@ void GenerateProject(const ultralight::JSObject& thisObject, const ultralight::J
         std::string outputDirStr = opts["outputDir"];
         std::string targetDllPathStr = opts["targetDllPath"];
 
-        // unescape the paths
         std::filesystem::path outputDir(outputDirStr);
         std::filesystem::path targetDllPath(targetDllPathStr);
 
-        // create the output directory
         std::filesystem::create_directories(outputDir);
         SafeEvalScript("updateStatus('Created project directory...', 'folder-plus', 'text-accent', 25);");
 
-        // get all exports from the original dll using lief
         auto original_binary = LIEF::PE::Parser::parse(targetDllPath.string());
         if (!original_binary || !original_binary->has_exports()) {
             SafeEvalScript("updateStatus('Error: Could not analyze target DLL.', 'alert-triangle', 'text-red-400', 0);");
@@ -363,16 +371,16 @@ void GenerateProject(const ultralight::JSObject& thisObject, const ultralight::J
         // --- Generate CMakeLists.txt ---
         std::ofstream cmake_file(outputDir / "CMakeLists.txt");
         cmake_file << "cmake_minimum_required(VERSION 3.15)\n"
-            << "project(" << projectName << " LANGUAGES CXX)\n\n"
+            << "project(" << projectName << " LANGUAGES CXX ASM_MASM)\n\n"
             << "set(CMAKE_CXX_STANDARD 17)\n"
             << "set(CMAKE_CXX_STANDARD_REQUIRED True)\n\n"
             << "add_library(" << projectName << " SHARED\n"
             << "    dllmain.cpp\n"
-            << "    proxy.cpp\n"
+            << "    proxy.asm\n"
             << ")\n\n"
             << "if(MSVC)\n"
             << "    set_target_properties(" << projectName << " PROPERTIES\n"
-            << "        LINK_FLAGS \"/DEF:${CMAKE_CURRENT_SOURCE_DIR}/" << projectName << ".def\"\n"
+            << "        LINK_FLAGS \"/DEF:\\\"${CMAKE_CURRENT_SOURCE_DIR}/" << projectName << ".def\\\"\"\n"
             << "    )\n"
             << "endif()";
         cmake_file.close();
@@ -390,10 +398,12 @@ void GenerateProject(const ultralight::JSObject& thisObject, const ultralight::J
         // --- Generate proxy.h ---
         std::ofstream proxy_h_file(outputDir / "proxy.h");
         proxy_h_file << "#pragma once\n"
-            << "#include <windows.h>\n\n";
+            << "#include <windows.h>\n\n"
+            << "extern \"C\" {\n";
         for (const auto& entry : selected_exports) {
-            proxy_h_file << "extern FARPROC pfn" << entry.name() << ";\n";
+            proxy_h_file << "    extern FARPROC pfn" << entry.name() << ";\n";
         }
+        proxy_h_file << "}\n";
         proxy_h_file.close();
 
         // --- Generate dllmain.cpp ---
@@ -402,11 +412,13 @@ void GenerateProject(const ultralight::JSObject& thisObject, const ultralight::J
         dllmain_file << "#include \"proxy.h\"\n"
             << "#include <string>\n\n"
             << "HMODULE hOriginalDll = NULL;\n"
-            << "const std::string originalDllName = \"" << originalDllName << "\";\n\n";
+            << "const std::string originalDllName = \"" << originalDllName << "\";\n\n"
+            << "extern \"C\" {\n";
         for (const auto& entry : selected_exports) {
-            dllmain_file << "FARPROC pfn" << entry.name() << " = NULL;\n";
+            dllmain_file << "    FARPROC pfn" << entry.name() << " = NULL;\n";
         }
-        dllmain_file << "\nvoid InitializeProxies(HMODULE hMod) {\n";
+        dllmain_file << "}\n\n"
+            << "void InitializeProxies(HMODULE hMod) {\n";
         for (const auto& entry : selected_exports) {
             dllmain_file << "    pfn" << entry.name() << " = GetProcAddress(hMod, \"" << entry.name() << "\");\n";
         }
@@ -418,6 +430,7 @@ void GenerateProject(const ultralight::JSObject& thisObject, const ultralight::J
             << "            hOriginalDll = LoadLibraryA(originalDllName.c_str());\n"
             << "            if (hOriginalDll) {\n"
             << "                InitializeProxies(hOriginalDll);\n"
+            << "                MessageBoxA(NULL, \"Proximo proxy DLL loaded successfully!\", \"Proxy Loaded\", MB_OK | MB_ICONINFORMATION);\n"
             << "            } else {\n"
             << "                MessageBoxA(NULL, \"Failed to load original DLL.\", \"Proxy Error\", MB_OK | MB_ICONERROR);\n"
             << "                return FALSE;\n"
@@ -432,15 +445,20 @@ void GenerateProject(const ultralight::JSObject& thisObject, const ultralight::J
         dllmain_file.close();
         SafeEvalScript("updateStatus('Generating source files...', 'file-code', 'text-accent', 70);");
 
-        // --- Generate proxy.cpp ---
-        std::ofstream proxy_cpp_file(outputDir / "proxy.cpp");
-        proxy_cpp_file << "#include \"proxy.h\"\n\n";
+        // --- Generate proxy.asm ---
+        std::ofstream proxy_asm_file(outputDir / "proxy.asm");
         for (const auto& entry : selected_exports) {
-            proxy_cpp_file << "extern \"C\" __declspec(naked) void " << entry.name() << "() {\n"
-                << "    __asm { jmp pfn" << entry.name() << " }\n"
-                << "}\n\n";
+            proxy_asm_file << "EXTERN pfn" << entry.name() << ":QWORD\n";
         }
-        proxy_cpp_file.close();
+        proxy_asm_file << "\n.CODE\n\n";
+        for (const auto& entry : selected_exports) {
+            proxy_asm_file << "PUBLIC " << entry.name() << "\n"
+                << entry.name() << " PROC\n"
+                << "    jmp qword ptr [pfn" << entry.name() << "]\n"
+                << entry.name() << " ENDP\n\n";
+        }
+        proxy_asm_file << "END\n";
+        proxy_asm_file.close();
 
         SafeEvalScript("updateStatus('Project generated successfully!', 'party-popper', 'text-success', 100);");
         std::cout << "Project generated successfully in " << outputDirStr << std::endl;
@@ -815,6 +833,8 @@ int main(int, char**)
 			dllListContainer.innerHTML = dlls.map(dll => {
 				const escapedPath = dll.path.replace(/"/g, '&quot;');
 				const escapedName = dll.name.replace(/"/g, '&quot;');
+                const isSystemClass = dll.isSystem ? 'text-red-400' : '';
+                const isDisabled = dll.isSystem ? 'disabled' : '';
 				
 				return `
 				<div class="flex items-center space-x-2 p-1.5 rounded hover:bg-[#3a3a3a]">
@@ -822,8 +842,8 @@ int main(int, char**)
 						   data-dll-name="${escapedName}" 
 						   data-dll-path="${escapedPath}" 
 						   class="dll-checkbox h-4 w-4 rounded bg-[#2a2a2a] border-[#4a4a4a] text-accent focus:ring-accent" 
-						   ${dll.selected ? 'checked' : ''}>
-					<label class="text-sm">${escapedName}</label>
+						   ${dll.selected ? 'checked' : ''} ${isDisabled}>
+					<label class="text-sm ${isSystemClass}">${escapedName}</label>
 				</div>`;
 			}).join('');
 			
@@ -972,6 +992,7 @@ int main(int, char**)
         dllListContainer.addEventListener('change', (e) => {
             if (e.target.classList.contains('dll-checkbox')) {
                 addDebugLog(`DLL checkbox changed: ${e.target.dataset.dllName} checked=${e.target.checked}`);
+                // this makes it act like a radio button group only one can be checked
                 if (e.target.checked) {
                     document.querySelectorAll('.dll-checkbox').forEach(cb => {
                         if (cb !== e.target) {

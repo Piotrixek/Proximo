@@ -1,0 +1,19 @@
+{
+  "name": "proximo-mcp-server",
+  "version": "1.0.0",
+  "description": "Proximo Model Context Protocol server for process inspection, DLL export analysis, proxy candidate ranking, and C++ proxy project generation",
+  "main": "index.js",
+  "bin": {
+    "proximo-mcp": "./index.js"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

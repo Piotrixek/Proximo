@@ -1,0 +1,85 @@
+How to Use the Generated Project
+Once you generate a project, you'll have a new folder with all the C++ source files. To use it:
+
+Find the original DLL you are proxying (e.g., AcGenral.dll).
+
+Rename it to AcGenral_original.dll.
+
+Compile the new project you just generated using CMake. This will produce your proxy DLL (e.g., ProxyTest.dll).
+
+Rename your new proxy DLL to match the original's name (e.g., rename ProxyTest.dll to AcGenral.dll).
+
+Place your new AcGenral.dll and the renamed AcGenral_original.dll in the application's directory.
+
+When the application loads your new AcGenral.dll, your proxy will load AcGenral_original.dll and forward all the calls. You can now add your own code to dllmain.cpp to run when the DLL is loaded!
+
+
+
+
+
+
+
+In select target dll i see for example AcGeneral.dll but in app files i dont see that DLL. What should i do after generating project of that dll exports ?
+
+
+Why You Don't See the DLL in the App's Folder
+When an application needs to load a DLL (like AcGenral.dll or a more common one like dinput8.dll), Windows doesn't just look in the application's main folder. It follows a specific DLL Search Order to find the file. A simplified version of this order is:
+
+The Application's Directory: The folder where the .exe is located.
+
+The System Directories: C:\Windows\System32 (for 64-bit DLLs) and C:\Windows\SysWOW64 (for 32-bit DLLs).
+
+Other locations, including the current working directory and folders in the system's PATH environment variable.
+
+The DLLs you see highlighted in red in the UI are System DLLs. They are part of Windows itself and live in the system directories. The application loads them from there, which is why you don't see a copy of AcGenral.dll inside the specific app's folder you are looking at.
+
+This is the exact behavior that allows proxying to work. We're going to take advantage of the fact that Windows checks the application's local directory first.
+
+What to Do After Generating the Project
+Here is a step-by-step guide on how to deploy your generated proxy DLL. Let's use a common example: proxying the system DLL dinput8.dll for a game called MyGame.exe.
+
+Step 1: Find the Original DLL
+Since dinput8.dll is a system DLL, you need to grab it from the Windows system folder.
+
+First, check if your target application (MyGame.exe) is 32-bit or 64-bit (you can see this in the Task Manager's "Details" tab).
+
+If the game is 64-bit, find the original dinput8.dll in: $C:\Windows\System32
+
+If the game is 32-bit, find the original dinput8.dll in: $C:\Windows\SysWOW64 (Yes, the naming is confusing!)
+
+Step 2: Prepare the Game's Directory
+Navigate to the folder where MyGame.exe is located (e.g., $C:\Games\MyGame).
+
+Copy the original dinput8.dll from the system folder (from Step 1) into the game's folder.
+
+Rename the DLL you just copied. The code we generated expects it to be renamed with an _original suffix. So, rename dinput8.dll to dinput8_original.dll.
+
+Your game folder should now contain MyGame.exe and dinput8_original.dll.
+
+Step 3: Build and Deploy Your Proxy DLL
+Open the project folder that Proximo generated for you.
+
+Use CMake and your compiler (like Visual Studio) to build the project. This will create your proxy DLL (e.g., MyProxyProject.dll).
+
+Rename your proxy DLL to match the original DLL's name exactly. In this case, rename MyProxyProject.dll to dinput8.dll.
+
+Copy your newly renamed dinput8.dll into the game's directory ($C:\Games\MyGame).
+
+Step 4: Run and Verify
+Now, your game's directory should look like this:
+
+MyGame.exe
+
+dinput8.dll (This is your proxy DLL)
+
+dinput8_original.dll (This is the real DLL)
+
+Launch MyGame.exe. Here's what happens:
+
+The game asks Windows to load dinput8.dll.
+
+Windows looks in the game's local folder first and finds your proxy dinput8.dll. It loads it.
+
+The DllMain in your proxy code executes. It then loads the renamed dinput8_original.dll.
+
+You should see the "Proximo proxy DLL loaded successfully!" MessageBox pop up.

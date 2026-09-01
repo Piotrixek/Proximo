@@ -1,4 +1,4 @@
-﻿#include <ShlObj.h>
+#include <ShlObj.h>
 #include <Windows.h>
 #include <atlbase.h>
 #include <gdiplus.h>
@@ -6,6 +6,7 @@
 #include <psapi.h>
 #include <shellapi.h>
 #include <tchar.h>
+#include <tlhelp32.h>
 
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
@@ -100,56 +101,132 @@ void CopyTextToClipboard(const ultralight::JSObject &currentObject, const ultral
     std::cout << "Successfully copied " << textToCopy.size() << " bytes to clipboard." << std::endl;
 }
 
+void EnableDebugPrivilege()
+{
+    HANDLE processTokenHandle = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &processTokenHandle))
+    {
+        TOKEN_PRIVILEGES tokenPrivileges;
+        LUID locallyUniqueIdentifier;
+        if (LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &locallyUniqueIdentifier))
+        {
+            tokenPrivileges.PrivilegeCount = 1;
+            tokenPrivileges.Privileges[0].Luid = locallyUniqueIdentifier;
+            tokenPrivileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(processTokenHandle, FALSE, &tokenPrivileges, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
+        }
+        CloseHandle(processTokenHandle);
+    }
+}
+
 void FetchRunningProcesses(const ultralight::JSObject &currentObject, const ultralight::JSArgs &functionArguments)
 {
-    std::vector<std::pair<DWORD, std::string>> activeProcesses;
-    DWORD processIdentifiers[1024], bytesReturned, processCount;
+    std::map<DWORD, std::string> detectedProcesses;
 
-    if (!EnumProcesses(processIdentifiers, sizeof(processIdentifiers), &bytesReturned))
+    HANDLE snapshotHandle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshotHandle != INVALID_HANDLE_VALUE)
     {
-        return;
+        PROCESSENTRY32W processEntry;
+        processEntry.dwSize = sizeof(PROCESSENTRY32W);
+
+        if (Process32FirstW(snapshotHandle, &processEntry))
+        {
+            do
+            {
+                if (processEntry.th32ProcessID != 0)
+                {
+                    std::string processName = ConvertWideStringToUtf8(processEntry.szExeFile);
+                    if (!processName.empty())
+                    {
+                        detectedProcesses[processEntry.th32ProcessID] = processName;
+                    }
+                }
+            } while (Process32NextW(snapshotHandle, &processEntry));
+        }
+        CloseHandle(snapshotHandle);
     }
 
-    processCount = bytesReturned / sizeof(DWORD);
-
-    for (unsigned int index = 0; index < processCount; index++)
+    DWORD processIdentifiers[4096];
+    DWORD bytesReturned = 0;
+    if (EnumProcesses(processIdentifiers, sizeof(processIdentifiers), &bytesReturned))
     {
-        if (processIdentifiers[index] != 0)
+        DWORD processCount = bytesReturned / sizeof(DWORD);
+        for (DWORD processIndex = 0; processIndex < processCount; processIndex++)
         {
-            WCHAR processNameBuffer[MAX_PATH] = L"<unknown>";
-            HANDLE processHandle =
-                OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processIdentifiers[index]);
-            if (NULL != processHandle)
+            DWORD currentProcessIdentifier = processIdentifiers[processIndex];
+            if (currentProcessIdentifier == 0)
             {
-                HMODULE moduleHandle;
-                DWORD moduleBytesReturned;
-                if (EnumProcessModules(processHandle, &moduleHandle, sizeof(moduleHandle), &moduleBytesReturned))
+                continue;
+            }
+
+            if (detectedProcesses.find(currentProcessIdentifier) == detectedProcesses.end())
+            {
+                std::string resolvedProcessName;
+                HANDLE processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, currentProcessIdentifier);
+                if (processHandle != NULL)
                 {
-                    GetModuleBaseNameW(processHandle, moduleHandle, processNameBuffer,
-                                       sizeof(processNameBuffer) / sizeof(WCHAR));
+                    WCHAR fullImagePathBuffer[MAX_PATH];
+                    DWORD pathBufferSize = MAX_PATH;
+                    if (QueryFullProcessImageNameW(processHandle, 0, fullImagePathBuffer, &pathBufferSize))
+                    {
+                        std::filesystem::path processExecutablePath(fullImagePathBuffer);
+                        resolvedProcessName = ConvertWideStringToUtf8(processExecutablePath.filename().wstring());
+                    }
+                    CloseHandle(processHandle);
                 }
-                activeProcesses.push_back({processIdentifiers[index], ConvertWideStringToUtf8(processNameBuffer)});
-                CloseHandle(processHandle);
+
+                if (resolvedProcessName.empty())
+                {
+                    HANDLE fallbackProcessHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, currentProcessIdentifier);
+                    if (fallbackProcessHandle != NULL)
+                    {
+                        WCHAR moduleBaseNameBuffer[MAX_PATH] = {0};
+                        HMODULE moduleHandle = NULL;
+                        DWORD moduleBytesNeeded = 0;
+                        if (EnumProcessModules(fallbackProcessHandle, &moduleHandle, sizeof(moduleHandle), &moduleBytesNeeded))
+                        {
+                            if (GetModuleBaseNameW(fallbackProcessHandle, moduleHandle, moduleBaseNameBuffer, MAX_PATH))
+                            {
+                                resolvedProcessName = ConvertWideStringToUtf8(moduleBaseNameBuffer);
+                            }
+                        }
+                        CloseHandle(fallbackProcessHandle);
+                    }
+                }
+
+                if (resolvedProcessName.empty())
+                {
+                    resolvedProcessName = "<unknown>";
+                }
+
+                detectedProcesses[currentProcessIdentifier] = resolvedProcessName;
             }
         }
     }
 
-    std::sort(activeProcesses.begin(), activeProcesses.end(), [](const auto &firstProcess, const auto &secondProcess) {
-        return firstProcess.second < secondProcess.second;
+    std::vector<std::pair<DWORD, std::string>> activeProcessesList(detectedProcesses.begin(), detectedProcesses.end());
+    std::sort(activeProcessesList.begin(), activeProcessesList.end(), [](const auto &firstProcess, const auto &secondProcess) {
+        std::string firstLower = firstProcess.second;
+        std::string secondLower = secondProcess.second;
+        std::transform(firstLower.begin(), firstLower.end(), firstLower.begin(), ::tolower);
+        std::transform(secondLower.begin(), secondLower.end(), secondLower.begin(), ::tolower);
+        if (firstLower != secondLower)
+        {
+            return firstLower < secondLower;
+        }
+        return firstProcess.first < secondProcess.first;
     });
 
-    std::stringstream jsonStream;
-    jsonStream << "[";
-    for (size_t index = 0; index < activeProcesses.size(); ++index)
+    json processListJsonArray = json::array();
+    for (const auto &processEntryItem : activeProcessesList)
     {
-        jsonStream << "{ \"pid\": " << activeProcesses[index].first << ", \"name\": \"" << activeProcesses[index].second
-                   << "\" }";
-        if (index < activeProcesses.size() - 1)
-            jsonStream << ",";
+        json singleProcessObject;
+        singleProcessObject["pid"] = processEntryItem.first;
+        singleProcessObject["name"] = processEntryItem.second;
+        processListJsonArray.push_back(singleProcessObject);
     }
-    jsonStream << "]";
 
-    ExecuteScriptSafely("populateProcessList(" + jsonStream.str() + ");");
+    ExecuteScriptSafely("populateProcessList(" + processListJsonArray.dump() + ");");
 }
 
 void FetchProcessModules(const ultralight::JSObject &currentObject, const ultralight::JSArgs &functionArguments)
@@ -177,112 +254,291 @@ void FetchProcessModules(const ultralight::JSObject &currentObject, const ultral
         "dsound.dll",   "xaudio2_9.dll", "xaudio2_8.dll", "xaudio2_7.dll",      "ws2_32.dll",         "winmm.dll",
         "version.dll",  "binkw32.dll",   "binkw64.dll",   "steam_api.dll",      "steam_api64.dll"};
 
-    std::vector<std::string> moduleJsonList;
-    HMODULE moduleHandles[2048];
-    HANDLE processHandle;
-    DWORD bytesNeeded;
-
-    processHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, targetProcessId);
-    if (NULL == processHandle)
+    struct ModuleInformationRecord
     {
-        ExecuteScriptSafely("populateModules({ modules: [] });");
-        return;
+        std::string moduleName;
+        std::string modulePath;
+        std::string moduleCategory;
+        bool is64Bit;
+    };
+
+    std::vector<ModuleInformationRecord> collectedModules;
+    std::set<std::string> seenModuleNames;
+    BOOL is32BitProcess = FALSE;
+
+    std::string targetExecutablePath;
+    HANDLE processLimitedHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, targetProcessId);
+    if (processLimitedHandle != NULL)
+    {
+        WCHAR fullPathBuffer[MAX_PATH];
+        DWORD fullPathSize = MAX_PATH;
+        if (QueryFullProcessImageNameW(processLimitedHandle, 0, fullPathBuffer, &fullPathSize))
+        {
+            targetExecutablePath = ConvertWideStringToUtf8(fullPathBuffer);
+        }
+        IsWow64Process(processLimitedHandle, &is32BitProcess);
+        CloseHandle(processLimitedHandle);
     }
 
-    BOOL is32BitProcess = FALSE;
-    IsWow64Process(processHandle, &is32BitProcess);
-
-    if (EnumProcessModulesEx(processHandle, moduleHandles, sizeof(moduleHandles), &bytesNeeded, LIST_MODULES_ALL))
+    HANDLE processHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, targetProcessId);
+    if (processHandle != NULL)
     {
-        bool hasFoundFirstSelectableModule = false;
+        IsWow64Process(processHandle, &is32BitProcess);
 
-        for (unsigned int index = 0; index < (bytesNeeded / sizeof(HMODULE)); index++)
+        HMODULE moduleHandles[2048];
+        DWORD bytesNeeded = 0;
+        if (EnumProcessModulesEx(processHandle, moduleHandles, sizeof(moduleHandles), &bytesNeeded, LIST_MODULES_ALL))
         {
-            WCHAR moduleNameBuffer[MAX_PATH];
-            WCHAR modulePathBuffer[MAX_PATH];
-            if (GetModuleBaseNameW(processHandle, moduleHandles[index], moduleNameBuffer,
-                                   sizeof(moduleNameBuffer) / sizeof(WCHAR)) &&
-                GetModuleFileNameExW(processHandle, moduleHandles[index], modulePathBuffer,
-                                     sizeof(modulePathBuffer) / sizeof(WCHAR)))
+            DWORD moduleCount = bytesNeeded / sizeof(HMODULE);
+            for (DWORD moduleIndex = 0; moduleIndex < moduleCount; moduleIndex++)
             {
-                MODULEINFO moduleInformation = {0};
-                GetModuleInformation(processHandle, moduleHandles[index], &moduleInformation,
-                                     sizeof(moduleInformation));
-
-                bool is64BitModule = (moduleInformation.lpBaseOfDll > (LPVOID)0x100000000);
-                if (is32BitProcess && is64BitModule)
+                WCHAR moduleNameBuffer[MAX_PATH] = {0};
+                WCHAR modulePathBuffer[MAX_PATH] = {0};
+                if (GetModuleBaseNameW(processHandle, moduleHandles[moduleIndex], moduleNameBuffer, MAX_PATH) &&
+                    GetModuleFileNameExW(processHandle, moduleHandles[moduleIndex], modulePathBuffer, MAX_PATH))
                 {
-                    continue;
+                    MODULEINFO moduleInformation = {0};
+                    GetModuleInformation(processHandle, moduleHandles[moduleIndex], &moduleInformation, sizeof(moduleInformation));
+
+                    bool is64BitModule = (moduleInformation.lpBaseOfDll > (LPVOID)0x100000000);
+                    if (is32BitProcess && is64BitModule)
+                    {
+                        continue;
+                    }
+
+                    std::string moduleName = ConvertWideStringToUtf8(moduleNameBuffer);
+                    std::string modulePath = ConvertWideStringToUtf8(modulePathBuffer);
+                    std::string lowerCaseModuleName = moduleName;
+                    std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(), ::tolower);
+
+                    if (seenModuleNames.insert(lowerCaseModuleName).second)
+                    {
+                        std::string moduleCategory = "neutral";
+                        if (systemModules.count(lowerCaseModuleName) > 0)
+                        {
+                            moduleCategory = "system";
+                        }
+                        else if (gameModules.count(lowerCaseModuleName) > 0)
+                        {
+                            moduleCategory = "good";
+                        }
+
+                        collectedModules.push_back({moduleName, modulePath, moduleCategory, is64BitModule});
+                    }
                 }
-
-                std::string moduleName = ConvertWideStringToUtf8(moduleNameBuffer);
-                std::string modulePath = ConvertWideStringToUtf8(modulePathBuffer);
-
-                std::string lowerCaseModuleName = moduleName;
-                std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(),
-                               ::tolower);
-
-                std::string moduleCategory = "neutral";
-                if (systemModules.count(lowerCaseModuleName) > 0)
-                {
-                    moduleCategory = "system";
-                }
-                else if (gameModules.count(lowerCaseModuleName) > 0)
-                {
-                    moduleCategory = "good";
-                }
-
-                bool isSelectable = (moduleCategory != "system");
-                bool isSelected = false;
-                if (isSelectable && !hasFoundFirstSelectableModule)
-                {
-                    isSelected = true;
-                    hasFoundFirstSelectableModule = true;
-                }
-
-                size_t pathPosition = 0;
-                while ((pathPosition = modulePath.find("\\", pathPosition)) != std::string::npos)
-                {
-                    modulePath.replace(pathPosition, 1, "\\\\");
-                    pathPosition += 2;
-                }
-
-                std::stringstream jsonStream;
-                jsonStream << "{ \"name\": \"" << moduleName << "\", \"path\": \"" << modulePath
-                           << "\", \"selected\": " << (isSelected ? "true" : "false") << ", \"category\": \""
-                           << moduleCategory << "\" }";
-                moduleJsonList.push_back(jsonStream.str());
             }
         }
+        CloseHandle(processHandle);
     }
-    CloseHandle(processHandle);
 
-    std::sort(moduleJsonList.begin(), moduleJsonList.end(),
-              [](const std::string &firstItem, const std::string &secondItem) {
-                  bool isFirstItemSystem = firstItem.find("\"category\": \"system\"") != std::string::npos;
-                  bool isSecondItemSystem = secondItem.find("\"category\": \"system\"") != std::string::npos;
-                  if (isFirstItemSystem != isSecondItemSystem)
-                  {
-                      return !isFirstItemSystem;
-                  }
-                  return firstItem < secondItem;
-              });
-
-    std::stringstream modulesArrayStream;
-    modulesArrayStream << "[";
-    for (size_t index = 0; index < moduleJsonList.size(); ++index)
+    if (collectedModules.empty())
     {
-        modulesArrayStream << moduleJsonList[index];
-        if (index < moduleJsonList.size() - 1)
-            modulesArrayStream << ",";
+        HANDLE moduleSnapshotHandle = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, targetProcessId);
+        if (moduleSnapshotHandle != INVALID_HANDLE_VALUE)
+        {
+            MODULEENTRY32W moduleEntry;
+            moduleEntry.dwSize = sizeof(MODULEENTRY32W);
+            if (Module32FirstW(moduleSnapshotHandle, &moduleEntry))
+            {
+                do
+                {
+                    std::string moduleName = ConvertWideStringToUtf8(moduleEntry.szModule);
+                    std::string modulePath = ConvertWideStringToUtf8(moduleEntry.szExePath);
+                    std::string lowerCaseModuleName = moduleName;
+                    std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(), ::tolower);
+
+                    if (seenModuleNames.insert(lowerCaseModuleName).second)
+                    {
+                        std::string moduleCategory = "neutral";
+                        if (systemModules.count(lowerCaseModuleName) > 0)
+                        {
+                            moduleCategory = "system";
+                        }
+                        else if (gameModules.count(lowerCaseModuleName) > 0)
+                        {
+                            moduleCategory = "good";
+                        }
+
+                        bool is64BitModule = ((uintptr_t)moduleEntry.modBaseAddr > 0x100000000ULL);
+                        if (!(is32BitProcess && is64BitModule))
+                        {
+                            collectedModules.push_back({moduleName, modulePath, moduleCategory, is64BitModule});
+                        }
+                    }
+                } while (Module32NextW(moduleSnapshotHandle, &moduleEntry));
+            }
+            CloseHandle(moduleSnapshotHandle);
+        }
     }
-    modulesArrayStream << "]";
 
-    std::stringstream finalJsonPayload;
-    finalJsonPayload << "{ \"is32BitProcess\": " << (is32BitProcess ? "true" : "false")
-                     << ", \"modules\": " << modulesArrayStream.str() << " }";
+    if (!targetExecutablePath.empty() && std::filesystem::exists(targetExecutablePath))
+    {
+        try
+        {
+            std::unique_ptr<LIEF::PE::Binary> parsedExecutableBinary = LIEF::PE::Parser::parse(targetExecutablePath);
+            if (parsedExecutableBinary)
+            {
+                bool binaryIs32Bit = (parsedExecutableBinary->type() == LIEF::PE::PE_TYPE::PE32);
+                if (collectedModules.empty())
+                {
+                    is32BitProcess = binaryIs32Bit ? TRUE : FALSE;
+                }
 
-    ExecuteScriptSafely("populateModules(" + finalJsonPayload.str() + ");");
+                std::filesystem::path executableDirectory = std::filesystem::path(targetExecutablePath).parent_path();
+                std::filesystem::path system32Directory = "C:\\Windows\\System32";
+                std::filesystem::path sysWow64Directory = "C:\\Windows\\SysWOW64";
+                std::filesystem::path systemDirectory = is32BitProcess ? sysWow64Directory : system32Directory;
+
+                auto resolveDllPath = [&](const std::string &candidateDllName) -> std::string {
+                    std::filesystem::path localCandidate = executableDirectory / candidateDllName;
+                    if (std::filesystem::exists(localCandidate))
+                    {
+                        return localCandidate.string();
+                    }
+
+                    std::filesystem::path systemCandidate = systemDirectory / candidateDllName;
+                    if (std::filesystem::exists(systemCandidate))
+                    {
+                        return systemCandidate.string();
+                    }
+
+                    std::filesystem::path system32Candidate = system32Directory / candidateDllName;
+                    if (std::filesystem::exists(system32Candidate))
+                    {
+                        return system32Candidate.string();
+                    }
+
+                    std::filesystem::path windowsCandidate = std::filesystem::path("C:\\Windows") / candidateDllName;
+                    if (std::filesystem::exists(windowsCandidate))
+                    {
+                        return windowsCandidate.string();
+                    }
+
+                    return localCandidate.string();
+                };
+
+                auto registerModuleCandidate = [&](const std::string &rawDllName) {
+                    if (rawDllName.empty())
+                    {
+                        return;
+                    }
+
+                    std::string lowerCaseModuleName = rawDllName;
+                    std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(), ::tolower);
+
+                    if (seenModuleNames.insert(lowerCaseModuleName).second)
+                    {
+                        std::string resolvedPath = resolveDllPath(rawDllName);
+                        std::string moduleCategory = "neutral";
+                        if (systemModules.count(lowerCaseModuleName) > 0)
+                        {
+                            moduleCategory = "system";
+                        }
+                        else if (gameModules.count(lowerCaseModuleName) > 0)
+                        {
+                            moduleCategory = "good";
+                        }
+
+                        collectedModules.push_back({rawDllName, resolvedPath, moduleCategory, !is32BitProcess});
+                    }
+                };
+
+                for (const LIEF::PE::Import &importEntry : parsedExecutableBinary->imports())
+                {
+                    registerModuleCandidate(importEntry.name());
+                }
+
+                if (parsedExecutableBinary->has_delay_imports())
+                {
+                    for (const LIEF::PE::DelayImport &delayImportEntry : parsedExecutableBinary->delay_imports())
+                    {
+                        registerModuleCandidate(delayImportEntry.name());
+                    }
+                }
+
+                try
+                {
+                    for (const auto &directoryEntry : std::filesystem::directory_iterator(executableDirectory))
+                    {
+                        if (directoryEntry.is_regular_file())
+                        {
+                            std::string extensionString = directoryEntry.path().extension().string();
+                            std::transform(extensionString.begin(), extensionString.end(), extensionString.begin(), ::tolower);
+                            if (extensionString == ".dll")
+                            {
+                                std::string localDllName = directoryEntry.path().filename().string();
+                                std::string localDllPath = directoryEntry.path().string();
+                                std::string lowerCaseModuleName = localDllName;
+                                std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(), ::tolower);
+
+                                if (seenModuleNames.insert(lowerCaseModuleName).second)
+                                {
+                                    std::string moduleCategory = "neutral";
+                                    if (systemModules.count(lowerCaseModuleName) > 0)
+                                    {
+                                        moduleCategory = "system";
+                                    }
+                                    else if (gameModules.count(lowerCaseModuleName) > 0)
+                                    {
+                                        moduleCategory = "good";
+                                    }
+
+                                    collectedModules.push_back({localDllName, localDllPath, moduleCategory, !is32BitProcess});
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (const std::exception &)
+                {
+                }
+            }
+        }
+        catch (const std::exception &)
+        {
+        }
+    }
+
+    std::sort(collectedModules.begin(), collectedModules.end(), [](const ModuleInformationRecord &firstItem, const ModuleInformationRecord &secondItem) {
+        auto getCategoryRank = [](const std::string &category) -> int {
+            if (category == "good") return 0;
+            if (category == "neutral") return 1;
+            return 2;
+        };
+        int firstRank = getCategoryRank(firstItem.moduleCategory);
+        int secondRank = getCategoryRank(secondItem.moduleCategory);
+        if (firstRank != secondRank)
+        {
+            return firstRank < secondRank;
+        }
+        return firstItem.moduleName < secondItem.moduleName;
+    });
+
+    bool hasFoundFirstSelectableModule = false;
+    json modulesJsonArray = json::array();
+    for (const auto &moduleItem : collectedModules)
+    {
+        bool isSelectable = (moduleItem.moduleCategory != "system");
+        bool isSelected = false;
+        if (isSelectable && !hasFoundFirstSelectableModule)
+        {
+            isSelected = true;
+            hasFoundFirstSelectableModule = true;
+        }
+
+        json moduleObject;
+        moduleObject["name"] = moduleItem.moduleName;
+        moduleObject["path"] = moduleItem.modulePath;
+        moduleObject["selected"] = isSelected;
+        moduleObject["category"] = moduleItem.moduleCategory;
+        modulesJsonArray.push_back(moduleObject);
+    }
+
+    json finalJsonPayload;
+    finalJsonPayload["is32BitProcess"] = is32BitProcess ? true : false;
+    finalJsonPayload["modules"] = modulesJsonArray;
+
+    ExecuteScriptSafely("populateModules(" + finalJsonPayload.dump() + ");");
 }
 
 std::string ExtractExportsAsJson(std::string &filePath)
@@ -652,6 +908,7 @@ void SpawnDebugConsole()
 int main(int, char **)
 {
     SpawnDebugConsole();
+    EnableDebugPrivilege();
     LIEF::logging::disable();
 
     HINSTANCE applicationInstance = GetModuleHandle(NULL);
@@ -843,7 +1100,14 @@ int main(int, char **)
             </div>
 
             <div class="space-y-2">
-                <label for="process-select" class="text-sm font-semibold text-primary/80">1. Select Process</label>
+                <div class="flex items-center justify-between">
+                    <label for="process-select" class="text-sm font-semibold text-primary/80">1. Select Process</label>
+                    <span id="process-count-badge" class="text-xs text-primary/50 font-mono">0 procs</span>
+                </div>
+                <div class="relative">
+                    <i data-lucide="search" class="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-primary/40"></i>
+                    <input type="text" id="process-search" placeholder="Search process by name or PID..." class="custom-input w-full p-2 pl-8 rounded-md text-sm">
+                </div>
                 <div class="flex items-center space-x-2">
                     <div class="relative flex-grow">
                         <select id="process-select" class="custom-select w-full p-2 rounded-md appearance-none">
@@ -853,7 +1117,7 @@ int main(int, char **)
                             <i data-lucide="chevron-down" class="w-4 h-4"></i>
                         </div>
                     </div>
-                    <button id="refresh-procs-btn" class="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] rounded-md">
+                    <button id="refresh-procs-btn" class="p-2 bg-[#3a3a3a] hover:bg-[#4a4a4a] rounded-md" title="Refresh Processes">
                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                     </button>
                 </div>
@@ -945,6 +1209,8 @@ int main(int, char **)
     htmlContentText += R"HTML_PART3(
     <script>
         const processDropdown = document.getElementById('process-select');
+        const processSearchInput = document.getElementById('process-search');
+        const processCountBadge = document.getElementById('process-count-badge');
         const refreshProcessesButton = document.getElementById('refresh-procs-btn');
         const moduleListContainer = document.getElementById('dll-list-container');
         const functionTableBodyElement = document.getElementById('function-table-body');
@@ -965,6 +1231,7 @@ int main(int, char **)
         const debugContentText = document.getElementById('debug-content');
         const hideDebugButton = document.getElementById('close-debug-btn');
 
+        let allRunningProcesses = [];
         let activeFunctionsList = [];
         let reportFunctionsList = [];
         let activeModulePath = '';
@@ -986,15 +1253,59 @@ int main(int, char **)
             debugPanelContainer.style.display = 'none';
         }
 
-        function populateProcessList(runningProcesses) {
-            appendToDebugLog(`populateProcessList called with ${runningProcesses.length} processes`);
-            processDropdown.innerHTML = '<option value="">Select a running process...</option>';
-            runningProcesses.forEach(processInfo => {
+        function filterProcessList() {
+            const searchTerm = processSearchInput ? processSearchInput.value.trim().toLowerCase() : '';
+            const currentlySelectedPid = processDropdown.value;
+
+            const filteredProcesses = allRunningProcesses.filter(processInfo => {
+                if (!searchTerm) return true;
+                const matchesName = processInfo.name.toLowerCase().includes(searchTerm);
+                const matchesPid = String(processInfo.pid).includes(searchTerm);
+                return matchesName || matchesPid;
+            });
+
+            if (processCountBadge) {
+                if (searchTerm) {
+                    processCountBadge.textContent = `${filteredProcesses.length}/${allRunningProcesses.length}`;
+                } else {
+                    processCountBadge.textContent = `${allRunningProcesses.length} procs`;
+                }
+            }
+
+            processDropdown.innerHTML = '';
+
+            if (filteredProcesses.length === 0) {
+                const emptyOption = document.createElement('option');
+                emptyOption.value = '';
+                emptyOption.textContent = 'No matching processes found';
+                processDropdown.appendChild(emptyOption);
+                return;
+            }
+
+            const defaultOption = document.createElement('option');
+            defaultOption.value = '';
+            defaultOption.textContent = searchTerm 
+                ? `Select process (${filteredProcesses.length} matches)...` 
+                : 'Select a running process...';
+            processDropdown.appendChild(defaultOption);
+
+            let hasRestoredSelection = false;
+            filteredProcesses.forEach(processInfo => {
                 const optionElement = document.createElement('option');
                 optionElement.value = processInfo.pid;
                 optionElement.textContent = `${processInfo.name} (PID: ${processInfo.pid})`;
+                if (String(processInfo.pid) === String(currentlySelectedPid)) {
+                    optionElement.selected = true;
+                    hasRestoredSelection = true;
+                }
                 processDropdown.appendChild(optionElement);
             });
+        }
+
+        function populateProcessList(runningProcesses) {
+            appendToDebugLog(`populateProcessList called with ${runningProcesses.length} processes`);
+            allRunningProcesses = runningProcesses;
+            filterProcessList();
             updateStatusMessage('Ready. Select a process.', 'list', 'text-primary/80');
         }
 
@@ -1228,6 +1539,21 @@ int main(int, char **)
         showDebugButton.addEventListener('click', displayDebugPanel);
         hideDebugButton.addEventListener('click', hideDebugPanel);
         
+        processSearchInput.addEventListener('input', () => {
+            filterProcessList();
+        });
+
+        processSearchInput.addEventListener('keydown', (keyboardEvent) => {
+            if (keyboardEvent.key === 'Enter') {
+                keyboardEvent.preventDefault();
+                const availableOptions = Array.from(processDropdown.options).filter(optionItem => optionItem.value !== '');
+                if (availableOptions.length > 0) {
+                    processDropdown.value = availableOptions[0].value;
+                    processDropdown.dispatchEvent(new Event('change'));
+                }
+            }
+        });
+
         refreshProcessesButton.addEventListener('click', () => {
             appendToDebugLog("Refresh processes button clicked");
             updateStatusMessage('Refreshing process list...', 'loader-2 animate-spin', 'text-accent');

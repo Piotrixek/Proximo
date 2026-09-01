@@ -35,6 +35,7 @@
 
 #include "json.hpp"
 #include "menu.h"
+#include "proximo_core.h"
 #include <LIEF/PE.hpp>
 #include <LIEF/logging.hpp>
 
@@ -50,15 +51,6 @@ void ExecuteScriptSafely(std::string javascriptCode)
     }
 }
 
-std::string ConvertWideStringToUtf8(const std::wstring &wideString)
-{
-    if (wideString.empty())
-        return std::string();
-    int requiredSize = WideCharToMultiByte(CP_UTF8, 0, &wideString[0], (int)wideString.size(), NULL, 0, NULL, NULL);
-    std::string utf8String(requiredSize, 0);
-    WideCharToMultiByte(CP_UTF8, 0, &wideString[0], (int)wideString.size(), &utf8String[0], requiredSize, NULL, NULL);
-    return utf8String;
-}
 
 void CopyTextToClipboard(const ultralight::JSObject &currentObject, const ultralight::JSArgs &functionArguments)
 {
@@ -101,131 +93,20 @@ void CopyTextToClipboard(const ultralight::JSObject &currentObject, const ultral
     std::cout << "Successfully copied " << textToCopy.size() << " bytes to clipboard." << std::endl;
 }
 
-void EnableDebugPrivilege()
-{
-    HANDLE processTokenHandle = NULL;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &processTokenHandle))
-    {
-        TOKEN_PRIVILEGES tokenPrivileges;
-        LUID locallyUniqueIdentifier;
-        if (LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &locallyUniqueIdentifier))
-        {
-            tokenPrivileges.PrivilegeCount = 1;
-            tokenPrivileges.Privileges[0].Luid = locallyUniqueIdentifier;
-            tokenPrivileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            AdjustTokenPrivileges(processTokenHandle, FALSE, &tokenPrivileges, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
-        }
-        CloseHandle(processTokenHandle);
-    }
-}
-
 void FetchRunningProcesses(const ultralight::JSObject &currentObject, const ultralight::JSArgs &functionArguments)
 {
-    std::map<DWORD, std::string> detectedProcesses;
-
-    HANDLE snapshotHandle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshotHandle != INVALID_HANDLE_VALUE)
-    {
-        PROCESSENTRY32W processEntry;
-        processEntry.dwSize = sizeof(PROCESSENTRY32W);
-
-        if (Process32FirstW(snapshotHandle, &processEntry))
-        {
-            do
-            {
-                if (processEntry.th32ProcessID != 0)
-                {
-                    std::string processName = ConvertWideStringToUtf8(processEntry.szExeFile);
-                    if (!processName.empty())
-                    {
-                        detectedProcesses[processEntry.th32ProcessID] = processName;
-                    }
-                }
-            } while (Process32NextW(snapshotHandle, &processEntry));
-        }
-        CloseHandle(snapshotHandle);
-    }
-
-    DWORD processIdentifiers[4096];
-    DWORD bytesReturned = 0;
-    if (EnumProcesses(processIdentifiers, sizeof(processIdentifiers), &bytesReturned))
-    {
-        DWORD processCount = bytesReturned / sizeof(DWORD);
-        for (DWORD processIndex = 0; processIndex < processCount; processIndex++)
-        {
-            DWORD currentProcessIdentifier = processIdentifiers[processIndex];
-            if (currentProcessIdentifier == 0)
-            {
-                continue;
-            }
-
-            if (detectedProcesses.find(currentProcessIdentifier) == detectedProcesses.end())
-            {
-                std::string resolvedProcessName;
-                HANDLE processHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, currentProcessIdentifier);
-                if (processHandle != NULL)
-                {
-                    WCHAR fullImagePathBuffer[MAX_PATH];
-                    DWORD pathBufferSize = MAX_PATH;
-                    if (QueryFullProcessImageNameW(processHandle, 0, fullImagePathBuffer, &pathBufferSize))
-                    {
-                        std::filesystem::path processExecutablePath(fullImagePathBuffer);
-                        resolvedProcessName = ConvertWideStringToUtf8(processExecutablePath.filename().wstring());
-                    }
-                    CloseHandle(processHandle);
-                }
-
-                if (resolvedProcessName.empty())
-                {
-                    HANDLE fallbackProcessHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, currentProcessIdentifier);
-                    if (fallbackProcessHandle != NULL)
-                    {
-                        WCHAR moduleBaseNameBuffer[MAX_PATH] = {0};
-                        HMODULE moduleHandle = NULL;
-                        DWORD moduleBytesNeeded = 0;
-                        if (EnumProcessModules(fallbackProcessHandle, &moduleHandle, sizeof(moduleHandle), &moduleBytesNeeded))
-                        {
-                            if (GetModuleBaseNameW(fallbackProcessHandle, moduleHandle, moduleBaseNameBuffer, MAX_PATH))
-                            {
-                                resolvedProcessName = ConvertWideStringToUtf8(moduleBaseNameBuffer);
-                            }
-                        }
-                        CloseHandle(fallbackProcessHandle);
-                    }
-                }
-
-                if (resolvedProcessName.empty())
-                {
-                    resolvedProcessName = "<unknown>";
-                }
-
-                detectedProcesses[currentProcessIdentifier] = resolvedProcessName;
-            }
-        }
-    }
-
-    std::vector<std::pair<DWORD, std::string>> activeProcessesList(detectedProcesses.begin(), detectedProcesses.end());
-    std::sort(activeProcessesList.begin(), activeProcessesList.end(), [](const auto &firstProcess, const auto &secondProcess) {
-        std::string firstLower = firstProcess.second;
-        std::string secondLower = secondProcess.second;
-        std::transform(firstLower.begin(), firstLower.end(), firstLower.begin(), ::tolower);
-        std::transform(secondLower.begin(), secondLower.end(), secondLower.begin(), ::tolower);
-        if (firstLower != secondLower)
-        {
-            return firstLower < secondLower;
-        }
-        return firstProcess.first < secondProcess.first;
-    });
-
+    json processListResult = GetRunningProcesses();
     json processListJsonArray = json::array();
-    for (const auto &processEntryItem : activeProcessesList)
+    if (processListResult.contains("processes"))
     {
-        json singleProcessObject;
-        singleProcessObject["pid"] = processEntryItem.first;
-        singleProcessObject["name"] = processEntryItem.second;
-        processListJsonArray.push_back(singleProcessObject);
+        for (const auto &processItem : processListResult["processes"])
+        {
+            json simpleObject;
+            simpleObject["pid"] = processItem["processIdentifier"];
+            simpleObject["name"] = processItem["processName"];
+            processListJsonArray.push_back(simpleObject);
+        }
     }
-
     ExecuteScriptSafely("populateProcessList(" + processListJsonArray.dump() + ");");
 }
 
@@ -238,361 +119,28 @@ void FetchProcessModules(const ultralight::JSObject &currentObject, const ultral
     }
 
     DWORD targetProcessId = static_cast<DWORD>(functionArguments[0].ToNumber());
-
-    const std::set<std::string> systemModules = {
-        "ntdll.dll",     "kernel32.dll",  "kernelbase.dll", "user32.dll",  "gdi32.dll",
-        "advapi32.dll",  "msvcrt.dll",    "ucrtbase.dll",   "combase.dll", "rpcrt4.dll",
-        "sechost.dll",   "comctl32.dll",  "shell32.dll",    "shlwapi.dll", "win32u.dll",
-        "gdi32full.dll", "msvcp_win.dll", "shcore.dll",     "uxtheme.dll", "wow64.dll",
-        "wow64cpu.dll",  "wow64win.dll",  "crypt32.dll",    "bcrypt.dll",  "bcryptprimitives.dll",
-        "sspicli.dll",   "cryptsp.dll",   "winhttp.dll",    "urlmon.dll",  "wininet.dll"};
-
-    const std::set<std::string> gameModules = {
-        "d3d8.dll",     "d3d9.dll",      "d3d10.dll",     "d3d11.dll",          "d3d12.dll",          "dxgi.dll",
-        "opengl32.dll", "glu32.dll",     "ddraw.dll",     "d3dcompiler_43.dll", "d3dcompiler_47.dll", "dinput.dll",
-        "dinput8.dll",  "xinput1_4.dll", "xinput1_3.dll", "xinput1_2.dll",      "xinput1_1.dll",      "xinput9_1_0.dll",
-        "dsound.dll",   "xaudio2_9.dll", "xaudio2_8.dll", "xaudio2_7.dll",      "ws2_32.dll",         "winmm.dll",
-        "version.dll",  "binkw32.dll",   "binkw64.dll",   "steam_api.dll",      "steam_api64.dll"};
-
-    struct ModuleInformationRecord
-    {
-        std::string moduleName;
-        std::string modulePath;
-        std::string moduleCategory;
-        bool is64Bit;
-    };
-
-    std::vector<ModuleInformationRecord> collectedModules;
-    std::set<std::string> seenModuleNames;
-    BOOL is32BitProcess = FALSE;
-
-    std::string targetExecutablePath;
-    HANDLE processLimitedHandle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, targetProcessId);
-    if (processLimitedHandle != NULL)
-    {
-        WCHAR fullPathBuffer[MAX_PATH];
-        DWORD fullPathSize = MAX_PATH;
-        if (QueryFullProcessImageNameW(processLimitedHandle, 0, fullPathBuffer, &fullPathSize))
-        {
-            targetExecutablePath = ConvertWideStringToUtf8(fullPathBuffer);
-        }
-        IsWow64Process(processLimitedHandle, &is32BitProcess);
-        CloseHandle(processLimitedHandle);
-    }
-
-    HANDLE processHandle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, targetProcessId);
-    if (processHandle != NULL)
-    {
-        IsWow64Process(processHandle, &is32BitProcess);
-
-        HMODULE moduleHandles[2048];
-        DWORD bytesNeeded = 0;
-        if (EnumProcessModulesEx(processHandle, moduleHandles, sizeof(moduleHandles), &bytesNeeded, LIST_MODULES_ALL))
-        {
-            DWORD moduleCount = bytesNeeded / sizeof(HMODULE);
-            for (DWORD moduleIndex = 0; moduleIndex < moduleCount; moduleIndex++)
-            {
-                WCHAR moduleNameBuffer[MAX_PATH] = {0};
-                WCHAR modulePathBuffer[MAX_PATH] = {0};
-                if (GetModuleBaseNameW(processHandle, moduleHandles[moduleIndex], moduleNameBuffer, MAX_PATH) &&
-                    GetModuleFileNameExW(processHandle, moduleHandles[moduleIndex], modulePathBuffer, MAX_PATH))
-                {
-                    MODULEINFO moduleInformation = {0};
-                    GetModuleInformation(processHandle, moduleHandles[moduleIndex], &moduleInformation, sizeof(moduleInformation));
-
-                    bool is64BitModule = (moduleInformation.lpBaseOfDll > (LPVOID)0x100000000);
-                    if (is32BitProcess && is64BitModule)
-                    {
-                        continue;
-                    }
-
-                    std::string moduleName = ConvertWideStringToUtf8(moduleNameBuffer);
-                    std::string modulePath = ConvertWideStringToUtf8(modulePathBuffer);
-                    std::string lowerCaseModuleName = moduleName;
-                    std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(), ::tolower);
-
-                    if (seenModuleNames.insert(lowerCaseModuleName).second)
-                    {
-                        std::string moduleCategory = "neutral";
-                        if (systemModules.count(lowerCaseModuleName) > 0)
-                        {
-                            moduleCategory = "system";
-                        }
-                        else if (gameModules.count(lowerCaseModuleName) > 0)
-                        {
-                            moduleCategory = "good";
-                        }
-
-                        collectedModules.push_back({moduleName, modulePath, moduleCategory, is64BitModule});
-                    }
-                }
-            }
-        }
-        CloseHandle(processHandle);
-    }
-
-    if (collectedModules.empty())
-    {
-        HANDLE moduleSnapshotHandle = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, targetProcessId);
-        if (moduleSnapshotHandle != INVALID_HANDLE_VALUE)
-        {
-            MODULEENTRY32W moduleEntry;
-            moduleEntry.dwSize = sizeof(MODULEENTRY32W);
-            if (Module32FirstW(moduleSnapshotHandle, &moduleEntry))
-            {
-                do
-                {
-                    std::string moduleName = ConvertWideStringToUtf8(moduleEntry.szModule);
-                    std::string modulePath = ConvertWideStringToUtf8(moduleEntry.szExePath);
-                    std::string lowerCaseModuleName = moduleName;
-                    std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(), ::tolower);
-
-                    if (seenModuleNames.insert(lowerCaseModuleName).second)
-                    {
-                        std::string moduleCategory = "neutral";
-                        if (systemModules.count(lowerCaseModuleName) > 0)
-                        {
-                            moduleCategory = "system";
-                        }
-                        else if (gameModules.count(lowerCaseModuleName) > 0)
-                        {
-                            moduleCategory = "good";
-                        }
-
-                        bool is64BitModule = ((uintptr_t)moduleEntry.modBaseAddr > 0x100000000ULL);
-                        if (!(is32BitProcess && is64BitModule))
-                        {
-                            collectedModules.push_back({moduleName, modulePath, moduleCategory, is64BitModule});
-                        }
-                    }
-                } while (Module32NextW(moduleSnapshotHandle, &moduleEntry));
-            }
-            CloseHandle(moduleSnapshotHandle);
-        }
-    }
-
-    if (!targetExecutablePath.empty() && std::filesystem::exists(targetExecutablePath))
-    {
-        try
-        {
-            std::unique_ptr<LIEF::PE::Binary> parsedExecutableBinary = LIEF::PE::Parser::parse(targetExecutablePath);
-            if (parsedExecutableBinary)
-            {
-                bool binaryIs32Bit = (parsedExecutableBinary->type() == LIEF::PE::PE_TYPE::PE32);
-                if (collectedModules.empty())
-                {
-                    is32BitProcess = binaryIs32Bit ? TRUE : FALSE;
-                }
-
-                std::filesystem::path executableDirectory = std::filesystem::path(targetExecutablePath).parent_path();
-                std::filesystem::path system32Directory = "C:\\Windows\\System32";
-                std::filesystem::path sysWow64Directory = "C:\\Windows\\SysWOW64";
-                std::filesystem::path systemDirectory = is32BitProcess ? sysWow64Directory : system32Directory;
-
-                auto resolveDllPath = [&](const std::string &candidateDllName) -> std::string {
-                    std::filesystem::path localCandidate = executableDirectory / candidateDllName;
-                    if (std::filesystem::exists(localCandidate))
-                    {
-                        return localCandidate.string();
-                    }
-
-                    std::filesystem::path systemCandidate = systemDirectory / candidateDllName;
-                    if (std::filesystem::exists(systemCandidate))
-                    {
-                        return systemCandidate.string();
-                    }
-
-                    std::filesystem::path system32Candidate = system32Directory / candidateDllName;
-                    if (std::filesystem::exists(system32Candidate))
-                    {
-                        return system32Candidate.string();
-                    }
-
-                    std::filesystem::path windowsCandidate = std::filesystem::path("C:\\Windows") / candidateDllName;
-                    if (std::filesystem::exists(windowsCandidate))
-                    {
-                        return windowsCandidate.string();
-                    }
-
-                    return localCandidate.string();
-                };
-
-                auto registerModuleCandidate = [&](const std::string &rawDllName) {
-                    if (rawDllName.empty())
-                    {
-                        return;
-                    }
-
-                    std::string lowerCaseModuleName = rawDllName;
-                    std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(), ::tolower);
-
-                    if (seenModuleNames.insert(lowerCaseModuleName).second)
-                    {
-                        std::string resolvedPath = resolveDllPath(rawDllName);
-                        std::string moduleCategory = "neutral";
-                        if (systemModules.count(lowerCaseModuleName) > 0)
-                        {
-                            moduleCategory = "system";
-                        }
-                        else if (gameModules.count(lowerCaseModuleName) > 0)
-                        {
-                            moduleCategory = "good";
-                        }
-
-                        collectedModules.push_back({rawDllName, resolvedPath, moduleCategory, !is32BitProcess});
-                    }
-                };
-
-                for (const LIEF::PE::Import &importEntry : parsedExecutableBinary->imports())
-                {
-                    registerModuleCandidate(importEntry.name());
-                }
-
-                if (parsedExecutableBinary->has_delay_imports())
-                {
-                    for (const LIEF::PE::DelayImport &delayImportEntry : parsedExecutableBinary->delay_imports())
-                    {
-                        registerModuleCandidate(delayImportEntry.name());
-                    }
-                }
-
-                try
-                {
-                    for (const auto &directoryEntry : std::filesystem::directory_iterator(executableDirectory))
-                    {
-                        if (directoryEntry.is_regular_file())
-                        {
-                            std::string extensionString = directoryEntry.path().extension().string();
-                            std::transform(extensionString.begin(), extensionString.end(), extensionString.begin(), ::tolower);
-                            if (extensionString == ".dll")
-                            {
-                                std::string localDllName = directoryEntry.path().filename().string();
-                                std::string localDllPath = directoryEntry.path().string();
-                                std::string lowerCaseModuleName = localDllName;
-                                std::transform(lowerCaseModuleName.begin(), lowerCaseModuleName.end(), lowerCaseModuleName.begin(), ::tolower);
-
-                                if (seenModuleNames.insert(lowerCaseModuleName).second)
-                                {
-                                    std::string moduleCategory = "neutral";
-                                    if (systemModules.count(lowerCaseModuleName) > 0)
-                                    {
-                                        moduleCategory = "system";
-                                    }
-                                    else if (gameModules.count(lowerCaseModuleName) > 0)
-                                    {
-                                        moduleCategory = "good";
-                                    }
-
-                                    collectedModules.push_back({localDllName, localDllPath, moduleCategory, !is32BitProcess});
-                                }
-                            }
-                        }
-                    }
-                }
-                catch (const std::exception &)
-                {
-                }
-            }
-        }
-        catch (const std::exception &)
-        {
-        }
-    }
-
-    std::sort(collectedModules.begin(), collectedModules.end(), [](const ModuleInformationRecord &firstItem, const ModuleInformationRecord &secondItem) {
-        auto getCategoryRank = [](const std::string &category) -> int {
-            if (category == "good") return 0;
-            if (category == "neutral") return 1;
-            return 2;
-        };
-        int firstRank = getCategoryRank(firstItem.moduleCategory);
-        int secondRank = getCategoryRank(secondItem.moduleCategory);
-        if (firstRank != secondRank)
-        {
-            return firstRank < secondRank;
-        }
-        return firstItem.moduleName < secondItem.moduleName;
-    });
-
-    bool hasFoundFirstSelectableModule = false;
-    json modulesJsonArray = json::array();
-    for (const auto &moduleItem : collectedModules)
-    {
-        bool isSelectable = (moduleItem.moduleCategory != "system");
-        bool isSelected = false;
-        if (isSelectable && !hasFoundFirstSelectableModule)
-        {
-            isSelected = true;
-            hasFoundFirstSelectableModule = true;
-        }
-
-        json moduleObject;
-        moduleObject["name"] = moduleItem.moduleName;
-        moduleObject["path"] = moduleItem.modulePath;
-        moduleObject["selected"] = isSelected;
-        moduleObject["category"] = moduleItem.moduleCategory;
-        modulesJsonArray.push_back(moduleObject);
-    }
-
-    json finalJsonPayload;
-    finalJsonPayload["is32BitProcess"] = is32BitProcess ? true : false;
-    finalJsonPayload["modules"] = modulesJsonArray;
-
-    ExecuteScriptSafely("populateModules(" + finalJsonPayload.dump() + ");");
+    json modulesResult = GetProcessModules(targetProcessId);
+    ExecuteScriptSafely("populateModules(" + modulesResult.dump() + ");");
 }
 
 std::string ExtractExportsAsJson(std::string &filePath)
 {
-    size_t currentPosition = 0;
-    while ((currentPosition = filePath.find("\\\\", currentPosition)) != std::string::npos)
-    {
-        filePath.replace(currentPosition, 2, "\\");
-        currentPosition += 1;
-    }
-
-    if (!std::filesystem::exists(filePath))
+    json exportResult = GetDllExports(filePath);
+    if (!exportResult["isSuccessful"].get<bool>() || !exportResult.contains("exportedFunctions"))
     {
         return "";
     }
-
     std::stringstream jsonStream;
-    std::string baseFileName = std::filesystem::path(filePath).filename().string();
-
-    try
+    bool isFirstFunction = true;
+    for (const auto &functionItem : exportResult["exportedFunctions"])
     {
-        std::unique_ptr<LIEF::PE::Binary> parsedBinary = LIEF::PE::Parser::parse(filePath);
-        if (!parsedBinary || !parsedBinary->has_exports())
+        if (!isFirstFunction)
         {
-            return "";
+            jsonStream << ",";
         }
-
-        bool isFirstFunction = true;
-        for (const LIEF::PE::ExportEntry &exportEntry : parsedBinary->get_export()->entries())
-        {
-            if (!isFirstFunction)
-                jsonStream << ",";
-
-            std::string functionName = exportEntry.name();
-            if (functionName.empty())
-            {
-                functionName = "ordinal_" + std::to_string(exportEntry.ordinal());
-            }
-
-            std::replace(functionName.begin(), functionName.end(), '"', '\'');
-            std::replace(functionName.begin(), functionName.end(), '\\', '/');
-
-            jsonStream << "{ \"name\": \"" << functionName << "\", "
-                       << "\"module\": \"" << baseFileName << "\", "
-                       << "\"type\": \"Export\", "
-                       << "\"parameters\": \"(...)\" }";
-            isFirstFunction = false;
-        }
+        jsonStream << functionItem.dump();
+        isFirstFunction = false;
     }
-    catch (const std::exception &)
-    {
-        return "";
-    }
-
     return jsonStream.str();
 }
 
@@ -604,8 +152,15 @@ void FetchExportedFunctions(const ultralight::JSObject &currentObject, const ult
         return;
     }
     std::string filePath = ultralight::String(functionArguments[0].ToString()).utf8().data();
-    std::string functionsJsonString = ExtractExportsAsJson(filePath);
-    ExecuteScriptSafely("populateFunctions([" + functionsJsonString + "]);");
+    json exportResult = GetDllExports(filePath);
+    if (exportResult["isSuccessful"].get<bool>() && exportResult.contains("exportedFunctions"))
+    {
+        ExecuteScriptSafely("populateFunctions(" + exportResult["exportedFunctions"].dump() + ");");
+    }
+    else
+    {
+        ExecuteScriptSafely("populateFunctions([]);");
+    }
 }
 
 void FetchExportsForMultipleModules(const ultralight::JSObject &currentObject,
@@ -618,28 +173,22 @@ void FetchExportsForMultipleModules(const ultralight::JSObject &currentObject,
     }
 
     ultralight::JSArray modulePathsArray = functionArguments[0].ToArray();
-    std::stringstream aggregatedResultsStream;
-    aggregatedResultsStream << "[";
-    bool isFirstEntry = true;
+    json combinedExportList = json::array();
 
     for (size_t index = 0; index < modulePathsArray.length(); ++index)
     {
         std::string filePath = ultralight::String(modulePathsArray[index].ToString()).utf8().data();
-        std::string functionsJsonString = ExtractExportsAsJson(filePath);
-
-        if (!functionsJsonString.empty())
+        json exportResult = GetDllExports(filePath);
+        if (exportResult["isSuccessful"].get<bool>() && exportResult.contains("exportedFunctions"))
         {
-            if (!isFirstEntry)
+            for (const auto &functionItem : exportResult["exportedFunctions"])
             {
-                aggregatedResultsStream << ",";
+                combinedExportList.push_back(functionItem);
             }
-            aggregatedResultsStream << functionsJsonString;
-            isFirstEntry = false;
         }
     }
 
-    aggregatedResultsStream << "]";
-    ExecuteScriptSafely("populateReportData(" + aggregatedResultsStream.str() + ");");
+    ExecuteScriptSafely("populateReportData(" + combinedExportList.dump() + ");");
 }
 
 void PromptUserForOutputFolder(const ultralight::JSObject &currentObject, const ultralight::JSArgs &functionArguments)
@@ -690,197 +239,24 @@ void CreateProxyProject(const ultralight::JSObject &currentObject, const ultrali
         return;
     }
     std::string jsonOptionsString = ultralight::String(functionArguments[0].ToString()).utf8().data();
-    std::cout << "Generating project with options: " << jsonOptionsString << std::endl;
 
     try
     {
         json parsedOptions = json::parse(jsonOptionsString);
-        std::string projectName = parsedOptions["projectName"];
-        std::string outputDirectoryString = parsedOptions["outputDir"];
-        std::string targetModulePathString = parsedOptions["targetDllPath"];
-
-        bool isTargetProcess32Bit = parsedOptions.value("isTargetProcess32Bit", false);
-        bool is64BitProcess = !isTargetProcess32Bit;
-
-        std::filesystem::path outputDirectory(outputDirectoryString);
-        std::filesystem::path targetModulePath(targetModulePathString);
-
-        std::filesystem::create_directories(outputDirectory);
-        ExecuteScriptSafely("updateStatusMessage('Created project directory...', 'folder-plus', 'text-accent', 25);");
-
-        auto targetDllBinary = LIEF::PE::Parser::parse(targetModulePath.string());
-        if (!targetDllBinary || !targetDllBinary->has_exports())
+        json generationResult = GenerateProxyProject(parsedOptions);
+        if (generationResult["isSuccessful"].get<bool>())
         {
-            ExecuteScriptSafely(
-                "updateStatusMessage('Error: Could not analyze target DLL.', 'alert-triangle', 'text-red-400', 0);");
-            return;
-        }
-
-        std::set<std::string> chosenFunctionNames;
-        for (const auto &functionNode : parsedOptions["functions"])
-        {
-            chosenFunctionNames.insert(functionNode["name"]);
-        }
-
-        struct ExportInformation
-        {
-            std::string codeName;
-            LIEF::PE::ExportEntry entryData;
-        };
-
-        std::vector<ExportInformation> selectedExportsList;
-        for (const LIEF::PE::ExportEntry &exportEntry : targetDllBinary->get_export()->entries())
-        {
-            std::string codeName = exportEntry.name();
-            if (codeName.empty())
-            {
-                codeName = "ordinal_" + std::to_string(exportEntry.ordinal());
-            }
-
-            if (chosenFunctionNames.count(codeName))
-            {
-                selectedExportsList.push_back({codeName, exportEntry});
-            }
-        }
-
-        std::ofstream cmakeBuildFile(outputDirectory / "CMakeLists.txt");
-        cmakeBuildFile << "cmake_minimum_required(VERSION 3.15)\n"
-                       << "project(" << projectName << " LANGUAGES CXX ASM_MASM)\n\n"
-                       << "set(CMAKE_CXX_STANDARD 17)\n"
-                       << "set(CMAKE_CXX_STANDARD_REQUIRED True)\n\n"
-                       << "add_library(" << projectName << " SHARED\n"
-                       << "    dllmain.cpp\n"
-                       << "    proxy.asm\n"
-                       << ")\n\n"
-                       << "if(MSVC)\n"
-                       << "    set_target_properties(" << projectName << " PROPERTIES\n"
-                       << "        LINK_FLAGS \"/DEF:\\\"${CMAKE_CURRENT_SOURCE_DIR}/" << projectName << ".def\\\"\"\n"
-                       << "    )\n"
-                       << "endif()";
-        cmakeBuildFile.close();
-        ExecuteScriptSafely("updateStatusMessage('Generating build system...', 'wrench', 'text-accent', 40);");
-
-        std::ofstream moduleDefinitionFile(outputDirectory / (projectName + ".def"));
-        moduleDefinitionFile << "LIBRARY " << projectName << "\n";
-        moduleDefinitionFile << "EXPORTS\n";
-        for (const auto &exportInfo : selectedExportsList)
-        {
-            moduleDefinitionFile << "    " << exportInfo.codeName << " @" << exportInfo.entryData.ordinal() << "\n";
-        }
-        moduleDefinitionFile.close();
-
-        std::ofstream proxyHeaderFile(outputDirectory / "proxy.h");
-        proxyHeaderFile << "#pragma once\n"
-                        << "#include <windows.h>\n\n"
-                        << "extern \"C\" {\n";
-        for (const auto &exportInfo : selectedExportsList)
-        {
-            proxyHeaderFile << "    extern FARPROC pfn" << exportInfo.codeName << ";\n";
-        }
-        proxyHeaderFile << "}\n";
-        proxyHeaderFile.close();
-
-        std::string originalModuleName = targetModulePath.stem().string() + "_original.dll";
-        std::ofstream dllMainSourceFile(outputDirectory / "dllmain.cpp");
-        dllMainSourceFile << "#include \"proxy.h\"\n"
-                          << "#include <string>\n\n"
-                          << "HMODULE hOriginalDll = NULL;\n"
-                          << "const std::string originalDllName = \"" << originalModuleName << "\";\n\n"
-                          << "extern \"C\" {\n";
-        for (const auto &exportInfo : selectedExportsList)
-        {
-            dllMainSourceFile << "    FARPROC pfn" << exportInfo.codeName << " = NULL;\n";
-        }
-        dllMainSourceFile << "}\n\n"
-                          << "void InitializeProxies(HMODULE hMod) {\n";
-
-        for (const auto &exportInfo : selectedExportsList)
-        {
-            if (exportInfo.entryData.name().empty())
-            {
-                dllMainSourceFile << "    pfn" << exportInfo.codeName << " = GetProcAddress(hMod, MAKEINTRESOURCEA("
-                                  << exportInfo.entryData.ordinal() << "));\n";
-            }
-            else
-            {
-                dllMainSourceFile << "    pfn" << exportInfo.codeName << " = GetProcAddress(hMod, \""
-                                  << exportInfo.entryData.name() << "\");\n";
-            }
-        }
-        dllMainSourceFile << "}\n\n"
-                          << "BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {\n"
-                          << "    switch (ul_reason_for_call) {\n"
-                          << "        case DLL_PROCESS_ATTACH:\n"
-                          << "            DisableThreadLibraryCalls(hModule);\n"
-                          << "            hOriginalDll = LoadLibraryA(originalDllName.c_str());\n"
-                          << "            if (hOriginalDll) {\n"
-                          << "                InitializeProxies(hOriginalDll);\n"
-                          << "            } else {\n"
-                          << "                MessageBoxA(NULL, \"Failed to load original DLL.\", \"Proxy Error\", "
-                             "MB_OK | MB_ICONERROR);\n"
-                          << "                return FALSE;\n"
-                          << "            }\n"
-                          << "            break;\n"
-                          << "        case DLL_PROCESS_DETACH:\n"
-                          << "            if (hOriginalDll) FreeLibrary(hOriginalDll);\n"
-                          << "            break;\n"
-                          << "    }\n"
-                          << "    return TRUE;\n"
-                          << "}";
-        dllMainSourceFile.close();
-        ExecuteScriptSafely("updateStatusMessage('Generating source files...', 'file-code', 'text-accent', 70);");
-
-        std::ofstream proxyAssemblyFile(outputDirectory / "proxy.asm");
-        if (is64BitProcess)
-        {
-            proxyAssemblyFile << ".CODE\n\n";
-            for (const auto &exportInfo : selectedExportsList)
-            {
-                proxyAssemblyFile << "EXTERN pfn" << exportInfo.codeName << ":QWORD\n";
-            }
-            proxyAssemblyFile << "\n";
-            for (const auto &exportInfo : selectedExportsList)
-            {
-                proxyAssemblyFile << "PUBLIC " << exportInfo.codeName << "\n"
-                                  << exportInfo.codeName << " PROC\n"
-                                  << "    jmp qword ptr [pfn" << exportInfo.codeName << "]\n"
-                                  << exportInfo.codeName << " ENDP\n\n";
-            }
+            ExecuteScriptSafely("updateStatusMessage('Project generated successfully!', 'party-popper', 'text-success', 100);");
         }
         else
         {
-            proxyAssemblyFile << ".MODEL FLAT, C\n\n.CODE\n\n";
-            for (const auto &exportInfo : selectedExportsList)
-            {
-                proxyAssemblyFile << "EXTERN pfn" << exportInfo.codeName << ":DWORD\n";
-            }
-            proxyAssemblyFile << "\n";
-            for (const auto &exportInfo : selectedExportsList)
-            {
-                proxyAssemblyFile << "PUBLIC " << exportInfo.codeName << "\n"
-                                  << exportInfo.codeName << " PROC\n"
-                                  << "    jmp dword ptr [pfn" << exportInfo.codeName << "]\n"
-                                  << exportInfo.codeName << " ENDP\n\n";
-            }
+            std::string errorMessage = generationResult.value("errorMessage", "Unknown error");
+            ExecuteScriptSafely("updateStatusMessage('Error: " + errorMessage + "', 'file-x', 'text-red-400', 0);");
         }
-        proxyAssemblyFile << "END\n";
-        proxyAssemblyFile.close();
-
-        ExecuteScriptSafely(
-            "updateStatusMessage('Project generated successfully!', 'party-popper', 'text-success', 100);");
-        std::cout << "Project generated successfully in " << outputDirectoryString << std::endl;
-    }
-    catch (const json::exception &exceptionDetails)
-    {
-        std::cout << "[FATAL] JSON parsing error: " << exceptionDetails.what() << std::endl;
-        ExecuteScriptSafely(
-            "updateStatusMessage('Error: Failed to parse generation options.', 'bug', 'text-red-400', 0);");
     }
     catch (const std::exception &exceptionDetails)
     {
-        std::cout << "[FATAL] File generation error: " << exceptionDetails.what() << std::endl;
-        ExecuteScriptSafely(
-            "updateStatusMessage('Error: Could not write project files.', 'file-x', 'text-red-400', 0);");
+        ExecuteScriptSafely("updateStatusMessage('Error: " + std::string(exceptionDetails.what()) + "', 'file-x', 'text-red-400', 0);");
     }
 }
 

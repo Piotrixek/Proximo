@@ -11,8 +11,17 @@ set(LIEF_DIR "C:/libs/LIEF-0.16.6-win64" CACHE PATH "Path to LIEF SDK")
 list(APPEND CMAKE_PREFIX_PATH ${LIEF_DIR})
 find_package(LIEF REQUIRED)
 
-file(GLOB APP_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
+set(CORE_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/proximo_core.cpp"
+)
+
+set(GUI_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/dx_setup.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/menu.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ui_style.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ultralight_controller.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/window_setup.cpp"
 )
 
 file(GLOB IMGUI_SOURCES
@@ -25,12 +34,19 @@ file(GLOB IMGUI_SOURCES
 )
 
 add_executable(${PROJECT_NAME} WIN32
-    ${APP_SOURCES}
+    ${CORE_SOURCES}
+    ${GUI_SOURCES}
     ${IMGUI_SOURCES}
+)
+
+add_executable(proximo_cli
+    ${CORE_SOURCES}
+    "${CMAKE_CURRENT_SOURCE_DIR}/cli_main.cpp"
 )
 
 if(MSVC)
     set_property(TARGET ${PROJECT_NAME} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    set_property(TARGET proximo_cli PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -38,6 +54,10 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     ${ULTRALIGHT_SDK_DIR}/include
+)
+
+target_include_directories(proximo_cli PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -52,7 +72,12 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     LIEF::LIEF
 )
 
+target_link_libraries(proximo_cli PRIVATE
+    LIEF::LIEF
+)
+
 target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX)
+target_compile_definitions(proximo_cli PRIVATE NOMINMAX)
 
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -65,6 +90,13 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         "$<TARGET_FILE:LIEF::LIEF>"
         "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
     COMMENT "Copying Ultralight & LIEF DLLs and resources"
+)
+
+add_custom_command(TARGET proximo_cli POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "$<TARGET_FILE:LIEF::LIEF>"
+        "$<TARGET_FILE_DIR:proximo_cli>"
+    COMMENT "Copying LIEF DLL for proximo_cli"
 )
 
 if(MSVC)

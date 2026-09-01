@@ -2,23 +2,20 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import path from "path";
-import fs from "fs";
 
-import { parsePeExports } from "./pe_parser.js";
 import {
     enumerateRunningProcesses,
     findProcessByIdentifierOrName,
     enumerateProcessModules,
-    analyzeProxyCandidatesForProcess
-} from "./process_manager.js";
-import {
+    parsePeExports,
+    analyzeProxyCandidatesForProcess,
     generateProxyProjectFiles,
     buildProxyProject
-} from "./proxy_generator.js";
+} from "./proximo_bridge.js";
 
 const serverInstance = new McpServer({
     name: "proximo-mcp-server",
-    version: "1.0.0"
+    version: "1.1.0"
 });
 
 serverInstance.tool(
@@ -118,7 +115,7 @@ serverInstance.tool(
                 type: "text",
                 text: JSON.stringify({
                     status: "success",
-                    targetProcess: modulesResult.process,
+                    targetProcess: modulesResult.targetProcess,
                     totalModulesCount: modulesResult.totalModulesCount,
                     modules: modulesResult.modules
                 }, null, 2)
@@ -129,13 +126,13 @@ serverInstance.tool(
 
 serverInstance.tool(
     "get_dll_exports",
-    "Parse PE headers of any DLL on disk and extract all exported functions with names, ordinals, RVAs, and forwarders.",
+    "Parse PE headers of any DLL on disk using LIEF and extract all exported functions with names, ordinals, RVAs, and forwarders.",
     {
         dllFilePath: z.string().describe("Absolute or relative file path to the target DLL file (e.g. C:\\Windows\\System32\\dinput8.dll)")
     },
     async (toolArguments) => {
         const resolvedPath = path.resolve(toolArguments.dllFilePath);
-        const exportResult = parsePeExports(resolvedPath);
+        const exportResult = await parsePeExports(resolvedPath);
 
         if (!exportResult.isSuccessful) {
             return {
@@ -170,7 +167,7 @@ serverInstance.tool(
 
 serverInstance.tool(
     "analyze_proxy_candidates",
-    "Inspect a running process, analyze all loaded DLLs, extract exports, and rank the best DLL proxy candidates (e.g. dinput8.dll, dxgi.dll, version.dll) with score and rationale.",
+    "Inspect a running process, analyze all loaded DLLs, extract exports via LIEF, and rank the best DLL proxy candidates (e.g. dinput8.dll, dxgi.dll, version.dll) with score and rationale.",
     {
         processIdentifierOrName: z.union([z.string(), z.number()]).describe("Process identifier (PID) or process executable name (e.g. game.exe or 1234)")
     },
@@ -219,7 +216,7 @@ serverInstance.tool(
         customPayloadCode: z.string().optional().describe("Custom C++ code to execute inside ExecuteCustomPayload() upon process injection")
     },
     async (toolArguments) => {
-        const generationResult = generateProxyProjectFiles({
+        const generationResult = await generateProxyProjectFiles({
             projectName: toolArguments.projectName,
             outputDirectoryPath: toolArguments.outputDirectoryPath,
             targetModulePath: toolArguments.targetModulePath,
@@ -361,7 +358,7 @@ async function startServer() {
     await serverInstance.connect(transportInstance);
 }
 
-startServer().catch((error) => {
-    process.stderr.write("Fatal MCP server error: " + error.message + "\n");
+startServer().catch((errorDetails) => {
+    process.stderr.write("Fatal MCP server error: " + errorDetails.message + "\n");
     process.exit(1);
 });
